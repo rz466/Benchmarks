@@ -1,0 +1,1449 @@
+---
+title: "Benchmark 1: log-scale"
+format: html
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE) 
+suppressPackageStartupMessages({
+  library(scuttle)
+  library(Matrix)
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(glassoFast)
+  library(clime)
+  library(SpatialNP)
+  library(GLassoElnetFast)
+  library(MASS)
+  library(jsonlite)
+  library(reticulate)
+  library(io)
+})
+```
+
+```{r}
+# Hurdle Simulator
+simulate_hurdle <- function(network, N, u_ij) {
+  K <- network$K
+  J <- network$J
+  lambda <- network$lambda
+  
+  # TF activities: a_ik ~ Gamma(alpha, alpha)
+  a_ik <- matrix(rgamma(N * K, shape = lambda$alpha, rate = lambda$alpha), nrow = N, ncol = K)
+  
+  # Experimental Knockdown on targets (1 - u_ij)
+  knockdown <- 1 - u_ij 
+  
+  # Scale TF activity if the knocked-down gene is a regulator
+  a_ik_masked <- a_ik
+  if(ncol(u_ij) >= K) {
+      a_ik_masked <- a_ik * knockdown[, 1:K]
+  }
+  
+  # Compute regulatory mean m_ij
+  m_ij <- exp(a_ik_masked %*% network$beta_kj)
+  
+  # Biological Switch: v_ij ~ Bernoulli(pi_j)
+  v_ij <- matrix(rbinom(N * J, size = 1, prob = rep(network$pi_j, each = N)), 
+                 nrow = N, ncol = J)
+  
+  # Latent True Expression: z_ij
+  z_ij <- matrix(0, nrow = N, ncol = J)
+  idx_on <- which(v_ij == 1, arr.ind = TRUE)
+  
+  if (nrow(idx_on) > 0) {
+    shape_vec <- m_ij[idx_on] * lambda$gamma
+    z_ij[idx_on] <- rgamma(nrow(idx_on), shape = shape_vec, rate = lambda$gamma)
+  }
+  
+  # Apply target perturbation mask: z'_ij = z_ij * (1 - u_ij)
+  z_ij_prime <- z_ij * knockdown
+  
+  # Marginalize t_ij:
+  # t_ij ~ Gamma(rho, rho), x_ij | t_ij, z'_ij ~ Poisson(t_ij z'_ij)
+  # implies x_ij | z'_ij ~ Negative Binomial(size = rho, mean = z'_ij)
+  x_ij <- matrix(rnbinom(N * J, size = lambda$rho, 
+                         mu = as.vector(z_ij_prime)), nrow = N, ncol = J)
+  
+  return(x_ij)
+}
+```
+
+```{r}
+# Ground Truth (Posterior Mean)
+lambda_best <- list(
+  theta = 0.2489,
+  gamma = 10.3517,
+  rho = 28.5281,
+  alpha = 7.1634,
+  sigma2 = 0.0978,
+  alpha_phi = 0.1914,
+  beta_phi = 1.2413,
+  alpha_psi = 1.6427,
+  beta_psi = 0.9929
+)
+
+generate_ground_truth_network <- function(K, J, lambda, seed = NULL) {
+  
+  old_seed_exists <- exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+  
+  if (!is.null(seed)) {
+    if (old_seed_exists) {
+      old_seed <- get(".Random.seed", envir = .GlobalEnv)
+    }
+    
+    set.seed(seed)
+    
+    on.exit({
+      if (old_seed_exists) {
+        assign(".Random.seed", old_seed, envir = .GlobalEnv)
+      } else if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
+        rm(".Random.seed", envir = .GlobalEnv)
+      }
+    }, add = TRUE)
+  }
+  
+  # Gene-specific on-probabilities pi_j ~ Beta(theta, 1-theta)
+  pi_j <- rbeta(J, shape1 = lambda$theta, shape2 = 1 - lambda$theta)
+  
+  # Regulatory effects beta_dot_kj ~ N(0, sigma^2) for K regulators to J targets
+  beta_dot_kj <- matrix(rnorm(K * J, mean = 0, sd = sqrt(lambda$sigma2)), nrow = K, ncol = J)
+  
+  # Target-specific edge propensity
+  phi_j <- rbeta(J, shape1 = lambda$alpha_phi, shape2 = lambda$beta_phi)
+  
+  # Regulator-specific edge propensity
+  psi_k <- rbeta(K, shape1 = lambda$alpha_psi, shape2 = lambda$beta_psi)
+  
+  # Edge probability
+  prob_kj <- outer(psi_k, phi_j, "*")
+  
+  # Binary adjacency matrix
+  delta_kj <- matrix(rbinom(K*J, size = 1, prob = as.vector(prob_kj)), nrow = K, ncol = J)
+  
+  # Unmasked regulatory effect beta_kj = beta_dot_kj * delta_kj
+  beta_kj <- beta_dot_kj * delta_kj
+  
+  list(beta_kj = beta_kj, delta_kj = delta_kj,  phi_j = phi_j, psi_k = psi_k, pi_j = pi_j, lambda = lambda, K = K, J = J)
+}
+
+J_sim <- 200
+K_sim <- 10
+ground_truth <- generate_ground_truth_network(K = K_sim, J = J_sim, lambda = lambda_best, seed = 123)
+
+# Model-based expected raw count vector x_j^(g)
+expected_x_g <- function(network, g_target = NULL, s = 0, Q = 1000) {
+  
+  K <- network$K
+  J <- network$J
+  lambda <- network$lambda
+  
+  # Simulate many TF activity samples a_ik
+  a_ik <- matrix(rgamma(Q * K, shape = lambda$alpha, rate = lambda$alpha), nrow = Q, ncol = K)
+  
+  # Regulator knockdown u_k
+  u_k <- rep(0, K)
+  
+  # Target expression knockdown u_j
+  u_j <- rep(0, J)
+  
+  if (!is.null(g_target)) {
+    u_j[g_target] <- s
+    
+    if (g_target <= K) {
+      u_k[g_target] <- s
+    }
+  }
+  
+  # Apply regulator perturbation inside m_ij
+  beta_masked <- sweep(network$beta_kj, 1, 1 - u_k, "*")
+  
+  # E_a[m_ij^(g)]
+  m_mat <- exp(a_ik %*% beta_masked)
+  E_m <- colMeans(m_mat)
+  
+  # x_j^(g) = pi_j(1-u_{ij}) E_a[m_ij^(g)]
+  X_g <- network$pi_j * (1 - u_j) * E_m
+  
+  X_g
+}
+```
+
+```{r}
+# Normalize raw UMI counts to log
+normalize_count_data <- function(Y_counts, offset = 1) {
+  
+  Y_counts <- as.matrix(Y_counts)
+  Y_counts[!is.finite(Y_counts)] <- 0
+  
+  # Library size for each cell
+  lib_size <- rowSums(Y_counts)
+  lib_size[!is.finite(lib_size) | lib_size <= 0] <- 1
+  
+  # log(counts / lib_size + offset)
+  log(sweep(Y_counts, 1, lib_size, "/") + offset)
+}
+
+# Same normalization logic for one expected count vector
+expected_to_log <- function(x_raw, offset = 1) {
+  
+  x_raw <- as.numeric(x_raw)
+  x_raw[!is.finite(x_raw)] <- 0
+  
+  lib_size <- sum(x_raw)
+  
+  if (!is.finite(lib_size) || lib_size <= 0) {
+    return(rep(log(offset), length(x_raw)))
+  }
+  
+  # log(x_j / L + offset)
+  log(x_raw / lib_size + offset)
+}
+
+# Convert one log-normalized expected vector back to linear UMI scale
+expected_log_to_raw <- function(x_log, L) {
+
+  x_log <- as.numeric(x_log)
+
+  if (
+    any(!is.finite(x_log)) ||
+    !is.finite(L) ||
+    L <= 0
+  ) {
+    return(rep(NA_real_, length(x_log)))
+  }
+
+  prop <- exp(x_log) - 1
+  prop[prop < 0] <- 0
+
+  prop_sum <- sum(prop)
+
+  if (!is.finite(prop_sum) || prop_sum <= 0) {
+    return(rep(NA_real_, length(x_log)))
+  }
+
+  # Condition every method on the known true perturbed library size
+  prop <- prop / prop_sum
+
+  L * prop
+}
+```
+
+```{r}
+# Lu & Feng (2025) implementation
+spatial_sign_covariance <- function(X) {
+  SpatialNP::SCov(as.matrix(X))
+}
+
+# Spatial likelihood loss for tuning kappa
+likelihood_loss <- function(Omega_hat, S_hat) {
+  J <- nrow(Omega_hat)
+  eig_vals <- eigen(Omega_hat, symmetric = TRUE, only.values = TRUE)$values
+  
+  # If estimated precision is not positive definite, discard this kappa
+  if (min(eig_vals) <= 0) {
+    return(Inf)
+  }
+  
+  sum(Omega_hat * (J * S_hat)) - sum(log(eig_vals))
+}
+
+# SGLASSO, SCLIME, and GELNET estimators
+precision_estimators <- function(X_train, X_val = NULL,
+                                 method = c("sglasso", "sclime", "gelnet"),
+                                 kappa_seq = NULL,
+                                 n_kappa = 50) {
+  
+  method <- match.arg(method)
+  n_train <- nrow(X_train)
+  J <- ncol(X_train)
+
+  # SGLASSO and SCLIME
+  if (method %in% c("sglasso", "sclime")) {
+    
+    # Default spatial kappa grid
+    if (is.null(kappa_seq)) {
+      base_kappa <- sqrt(log(J) / n_train)
+      kappa_seq <- seq(0.05, 1.5, length.out = n_kappa) * base_kappa
+    }
+
+    S_hat_train <- spatial_sign_covariance(X_train)
+    S_hat_val <- spatial_sign_covariance(X_val)
+
+    n_kap <- length(kappa_seq)
+    loss <- numeric(n_kap)
+    Omega_list <- vector("list", n_kap)
+
+    # SGLASSO
+    if (method == "sglasso") {
+      for (k in seq_len(n_kap)) {
+        kap <- kappa_seq[k]
+        fit <- glassoFast::glassoFast(S = J * S_hat_train, rho = kap)
+        Omega_hat <- fit$wi
+        Omega_list[[k]] <- Omega_hat
+        loss[k] <- likelihood_loss(Omega_hat = Omega_hat, S_hat = S_hat_val)
+      }
+    } 
+    
+    # SCLIME
+    else if (method == "sclime") {
+      clime_fit <- clime::clime(x = J * S_hat_train, lambda = kappa_seq, 
+                                sigma = TRUE, standardize = FALSE)
+      for (k in seq_len(n_kap)) {
+        Omega_raw <- clime_fit$Omega[[k]]
+        
+        # Min-absolute symmetrization
+        Omega_sym <- Omega_raw
+        for (i in 1:(J - 1)) {
+          for (j in (i + 1):J) {
+            if (abs(Omega_sym[i, j]) > abs(Omega_sym[j, i])) {
+              Omega_sym[i, j] <- Omega_sym[j, i]
+            } else {
+              Omega_sym[j, i] <- Omega_sym[i, j]
+            }
+          }
+        }
+        
+        Omega_hat <- Omega_sym
+        Omega_list[[k]] <- Omega_hat
+        loss[k] <- likelihood_loss(Omega_hat = Omega_hat, S_hat = S_hat_val)
+      }
+    }
+    
+    best_idx <- which.min(loss)
+    
+    return(list(Omega_opt = Omega_list[[best_idx]]))
+  } 
+
+  # GELNET
+  else if (method == "gelnet") {
+    
+    gen_kappa_grid <- 0.9^c(0:40)
+    
+    # Identify genes with meaningful variance
+    gene_sds <- apply(X_train, 2, sd)
+    good_genes <- which(gene_sds > 1e-5)
+    
+    # Initialize matrix (1s on the diagonal instead of 0s) to prevent inverse explosion
+    Omega_opt_full <- diag(J)
+    Sigma_opt_full <- diag(J)
+    
+    # Only attempt CV if there are enough valid genes
+    if (length(good_genes) >= 2) {
+      
+      # Subset the data
+      X_train_sub <- as.matrix(X_train[, good_genes, drop = FALSE])
+      
+      cv_fit <- tryCatch({
+        GLassoElnetFast::crossvalidation(
+          Y = X_train_sub, 
+          lambda = gen_kappa_grid, 
+          alpha = 0.5, 
+          cor = TRUE,
+          type = "Identity"
+        )
+      }, error = function(e) { return(NULL) })
+      
+      # Map the estimated network back
+      if (!is.null(cv_fit)) {
+        
+        # Each gene’s standard deviation in the training data
+        sd_sub <- apply(X_train_sub, 2, sd)
+        sd_sub[!is.finite(sd_sub) | sd_sub <= 1e-8] <- 1e-8
+        
+        D <- diag(sd_sub)
+        D_inv <- diag(1 / sd_sub)
+        
+        Sigma_sub <- D %*% cv_fit$W %*% D
+        Omega_sub <- D_inv %*% cv_fit$Theta %*% D_inv
+        
+        Sigma_opt_full[good_genes, good_genes] <- Sigma_sub
+        Omega_opt_full[good_genes, good_genes] <- Omega_sub
+      }
+    }
+    
+    # Apply stabilization
+    Omega_opt_full <- make_positive_definite_capped(Omega_opt_full, 
+                                                    min_eig = 1e-6, max_cond = 1e4)
+    Sigma_opt_full <- make_positive_definite_capped(Sigma_opt_full, 
+                                                    min_eig = 1e-6, max_cond = 1e4)
+    
+    return(list(Omega_opt = Omega_opt_full, Sigma_opt = Sigma_opt_full))
+  }
+}
+```
+
+```{r}
+# Simulate a perturbed single-cell count matrix Y^(g,s)
+simulate_perturbed_counts <- function(network, N, g_target, s) {
+  J <- network$J
+  
+  u_ij <- matrix(0, nrow = N, ncol = J)
+  u_ij[, g_target] <- s
+  
+  simulate_hurdle(network, N = N, u_ij = u_ij)
+}
+
+# Run scGPT for one replicate and one knockdown strength
+run_scgpt <- function(network, Y_0, n_pert, g_target, s, n, rep) {
+  
+  scgpt_seed <- 1000000 + 10000 * n + 100 * rep + round(10 * s)
+  
+  old_seed_exists <- exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+  if (old_seed_exists) {
+    old_seed <- get(".Random.seed", envir = .GlobalEnv)
+  }
+  
+  set.seed(scgpt_seed)
+  
+  on.exit({
+    if (old_seed_exists) {
+      assign(".Random.seed", old_seed, envir = .GlobalEnv)
+    } else if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
+      rm(".Random.seed", envir = .GlobalEnv)
+    }
+  }, add = TRUE)
+  
+  J <- network$J
+  K <- network$K
+  
+  run_id <- paste0(
+    "log_lib_",
+    "n", n,
+    "_rep", rep,
+    "_s", gsub("\\.", "p", as.character(s)),
+    "_g", g_target
+  )
+  
+  run_dir <- file.path("results/scgpt_bm1", run_id)
+  dir.create(run_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  pred_file <- file.path(run_dir, "prediction.tsv")
+  
+  # Reuse cached scGPT prediction if it already exists
+  if (file.exists(pred_file)) {
+    pred_df <- read.table(pred_file, header = TRUE, sep = "\t")
+    return(as.numeric(pred_df$pred))
+  }
+  
+  # Hold out the true target gene from scGPT training
+  train_genes <- setdiff(seq_len(K), g_target)
+  
+  train_input_list <- list()
+  train_target_list <- list()
+  train_pert_idx <- integer(0)
+  
+  row_id <- 1
+  
+  for (g_train in train_genes) {
+    
+    # Pair control cells with this training perturbation
+    ctrl_idx <- sample(seq_len(nrow(Y_0)), size = n_pert, replace = TRUE)
+    Y_input_g <- Y_0[ctrl_idx, , drop = FALSE]
+    
+    # Simulate perturbed cells for this training perturbation
+    Y_target_g <- simulate_perturbed_counts(network = network, N = n_pert,
+                                            g_target = g_train, s = s)
+    Y_target_g <- normalize_count_data(Y_target_g, offset = 1)
+    
+    train_input_list[[row_id]] <- Y_input_g
+    train_target_list[[row_id]] <- Y_target_g
+    
+    # Python uses zero-based gene indices
+    train_pert_idx <- c(train_pert_idx, rep(g_train - 1, n_pert))
+    
+    row_id <- row_id + 1
+  }
+  
+  train_input <- do.call(rbind, train_input_list)
+  train_target <- do.call(rbind, train_target_list)
+  
+  write.table(Y_0, file.path(run_dir, "Y0.tsv"),
+              sep = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
+  
+  write.table(train_input, file.path(run_dir, "train_input.tsv"),
+              sep = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
+  
+  write.table(train_target, file.path(run_dir, "train_target.tsv"),
+              sep = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
+  
+  write.table(train_pert_idx, file.path(run_dir, "train_pert_idx.tsv"),
+              sep = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
+  
+  jsonlite::write_json(
+    list(
+      J = J,
+      K = K,
+      g_target_zero_based = g_target - 1,
+      s = s,
+      n = n,
+      rep = rep
+    ),
+    file.path(run_dir, "meta.json"),
+    auto_unbox = TRUE
+  )
+  
+  python_cmd <- "/Users/zhangrui/miniforge3/envs/scgpt/bin/python"
+  
+  status <- system2(
+    command = python_cmd,
+    args = c(
+      "run_scgpt_bm1.py",
+      "--input_dir", run_dir,
+      "--output_file", pred_file,
+      "--epochs", "15",
+      "--patience", "5",
+      "--seed", as.character(scgpt_seed),
+      "--log1p", "0",
+      "--batch_size", "64",
+      "--eval_batch_size", "64"
+    ),
+    stdout = file.path(run_dir, "scgpt_stdout.log"),
+    stderr = file.path(run_dir, "scgpt_stderr.log")
+  )
+  
+  if (!identical(status, 0L) || !file.exists(pred_file)) {
+    warning("scGPT failed for ", run_id, ". Returning NA prediction.")
+    return(rep(NA, J))
+  }
+  
+  pred_df <- read.table(pred_file, header = TRUE, sep = "\t")
+  as.numeric(pred_df$pred)
+}
+```
+
+```{r}
+# Rhaister
+Sys.setenv(RETICULATE_PYTHON = "/Users/zhangrui/miniforge3/envs/scgpt/bin/python")
+source_python("/Users/zhangrui/Desktop/precmat/rhaister.py")
+np <- import("numpy", convert = FALSE)
+rhaister_py <- import_main(convert = TRUE)
+als_decompose <- rhaister_py$`_als_decompose`
+impute_view_into_data <- rhaister_py$`_impute_view_into_data`
+compute_regression <- rhaister_py$`_compute_regression`
+
+# Run Rhaister for one target perturbation
+# learn relationship in reference contexts, then apply that relationship to query context
+run_rhaister <- function(network, x_0, g_target, s, N, panel_genes = NULL, ref_context = 5) {
+
+  J <- network$J
+  K <- network$K
+  
+  # If panel_genes is not given, use all perturbations except the held-out target perturbation
+  if (is.null(panel_genes)) {panel_genes <- setdiff(seq_len(K), g_target)}
+  
+  # Store J-dimensional observed shift vectors
+  d_train_list <- list()
+  
+  # Store the context label for each row, here cells = contexts: query, ref1, ref2,...
+  train_cells <- character(0)
+  
+  # Store the perturbation label for each row, here treatments = perturbations: g1, g2,...
+  train_treatments <- character(0)
+
+  # Query context: the target perturbation is hidden, only observes the panel perturbations
+  for (g in panel_genes) {
+    
+    # Compute the observed shift vector d^(g)
+    Y_g_counts <- simulate_perturbed_counts(network = network, N = N, g_target = g, s = s)
+    Y_g <- normalize_count_data(Y_g_counts, offset = 1)
+    d_g <- colMeans(Y_g) - x_0
+
+    d_train_list[[length(d_train_list) + 1]] <- as.numeric(d_g)
+    train_cells <- c(train_cells, "query")
+    train_treatments <- c(train_treatments, paste0("g", g))
+  }
+
+  # Reference contexts: include both panel and held-out target perturbation
+  for (r in seq_len(ref_context)) {
+    
+    # Label current reference context
+    ref_id <- paste0("ref", r)
+    
+    # Measure both panel and target perturbation in this reference context
+    genes_to_measure <- c(panel_genes, g_target)
+    
+    for (g in genes_to_measure) {
+      
+      # Compute the observed shift vector d^(g)
+      Y_g_counts <- simulate_perturbed_counts(network = network, N = N, g_target = g, s = s)
+      Y_g <- normalize_count_data(Y_g_counts, offset = 1)
+      d_g <- colMeans(Y_g) - x_0
+
+      d_train_list[[length(d_train_list) + 1]] <- as.numeric(d_g)
+      train_cells <- c(train_cells, ref_id)
+      train_treatments <- c(train_treatments, paste0("g", g))
+    }
+  }
+  
+  # Build data 
+  rhaister_data <- list(
+    
+    # Matrix of observed shift vectors: observed context-perturbation rows × J genes
+    Y_train = do.call(rbind, d_train_list),
+    
+    # Context label for each row of Y_train
+    train_cells = np$array(train_cells, dtype = "object"),
+    
+    # Perturbation label for each row of Y_train
+    train_treatments = np$array(train_treatments, dtype = "object"),
+    
+    # The missing context to predict
+    test_cells = reticulate::r_to_py(list("query"), convert = FALSE),
+    
+    # The missing perturbation to predict in the query context
+    test_treatments = reticulate::r_to_py(list(paste0("g", g_target)), convert = FALSE),
+    
+    # There is one held-out query-target pair
+    n_test = as.integer(1)
+  )
+  
+  # Fit ALS additive baseline
+  rhaister_data$evaluate_test <- function(Y_pred) list()
+  als_result <- als_decompose(data = rhaister_data, return_pred = TRUE, log = FALSE)
+  
+  # Use ALS output to fill missing context-perturbation rows
+  data_reg <- impute_view_into_data(data = rhaister_data, Y_view = rhaister_data$Y_train,
+                                    mu = als_result$mu, cell_eff = als_result$cell_effects,
+                                    treat_eff = als_result$treat_effects,
+                                    cell_map = als_result$local_cell_map,
+                                    treat_map = als_result$local_treat_map,
+                                    label = "BM1 Rhaister")
+  
+  # force length-one test fields to Python lists after filling
+  data_reg$test_cells <- reticulate::r_to_py(list("query"), convert = FALSE)
+  data_reg$test_treatments <- reticulate::r_to_py(list(paste0("g", g_target)), convert = FALSE)
+  
+  # Run Rhaister regression
+  reg_out <- compute_regression(data = data_reg, lam = 1.0, center = FALSE, quiet = TRUE)
+  
+  # Extract the predicted shift matrix
+  d_pred_mat <- reg_out[[1]]
+  
+  # Extract the predicted shift vector for the held-out target perturbation
+  d_hat <- as.numeric(d_pred_mat[1, ])
+  
+  d_hat
+}
+```
+
+```{r}
+# ABC-SMC
+# 1) Summary statistics for ABC
+summaries <- function(X) {
+
+  x_all <- as.vector(X) 
+  x_nonzero <- x_all[x_all > 0 & !is.na(x_all)]
+  
+  if (length(x_nonzero) == 0 || any(!is.finite(x_all))) {
+    return(rep(NA, 54)) 
+  }
+
+  C_i <- rowMeans(X)
+  D_i <- rowMeans(X > 0)
+  G_j <- colMeans(X)
+  M_j <- colMeans(X > 0)
+
+  probs_use <- c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+
+  c(
+    quantile(x_all, probs = probs_use, na.rm = TRUE, names = FALSE),
+    quantile(x_nonzero, probs = probs_use, na.rm = TRUE, names = FALSE),
+    quantile(C_i, probs = probs_use, na.rm = TRUE, names = FALSE),
+    quantile(D_i, probs = probs_use, na.rm = TRUE, names = FALSE),
+    quantile(G_j, probs = probs_use, na.rm = TRUE, names = FALSE),
+    quantile(M_j, probs = probs_use, na.rm = TRUE, names = FALSE)
+  )
+}
+
+# 2) ABC distance
+distance_abc <- function(S_sim, S_obs) {
+  d <- sqrt(sum((S_sim - S_obs)^2))
+  
+  # If distance is NA, return Infinity to force rejection
+  if (!is.finite(d)) {
+    return(Inf)
+  }
+  
+  d
+}
+
+# 3) Prior ranges
+prior_range <- list(
+  theta = c(0.05, 0.95),
+  gamma = c(1.5, 25),
+  rho = c(10, 60),
+  alpha = c(2, 20),
+  sigma2 = c(0.05, 0.15),
+  alpha_phi = c(0.1, 5),
+  beta_phi = c(0.1, 10),
+  alpha_psi = c(0.1, 5),
+  beta_psi = c(0.1, 10)
+)
+
+# Sample one hyperparameter from its prior
+sample_lambda <- function() {
+  list(
+    # Uniform prior
+    theta = runif(1, min = prior_range$theta[1], max = prior_range$theta[2]),
+    
+    # Log-uniform priors
+    gamma = exp(runif(1, min = log(prior_range$gamma[1]), max = log(prior_range$gamma[2]))),
+    rho = exp(runif(1, min = log(prior_range$rho[1]), max = log(prior_range$rho[2]))),
+    alpha = exp(runif(1, min = log(prior_range$alpha[1]), max = log(prior_range$alpha[2]))),
+    sigma2 = exp(runif(1, min = log(prior_range$sigma2[1]), max = log(prior_range$sigma2[2]))),
+    alpha_phi = exp(runif(1, min = log(prior_range$alpha_phi[1]), max = log(prior_range$alpha_phi[2]))),
+    beta_phi = exp(runif(1, min = log(prior_range$beta_phi[1]), max = log(prior_range$beta_phi[2]))),
+    alpha_psi = exp(runif(1, min = log(prior_range$alpha_psi[1]), max = log(prior_range$alpha_psi[2]))),
+    beta_psi = exp(runif(1, min = log(prior_range$beta_psi[1]),max = log(prior_range$beta_psi[2])))
+  )
+}
+
+# 4) Prior density
+prior_density <- function(lambda) {
+
+  inside_support <- (
+    lambda$theta >= prior_range$theta[1] &&
+      lambda$theta <= prior_range$theta[2] &&
+    lambda$gamma >= prior_range$gamma[1] &&
+      lambda$gamma <= prior_range$gamma[2] &&
+    lambda$rho >= prior_range$rho[1] &&
+      lambda$rho <= prior_range$rho[2] &&
+    lambda$alpha >= prior_range$alpha[1] &&
+      lambda$alpha <= prior_range$alpha[2] &&
+    lambda$sigma2 >= prior_range$sigma2[1] &&
+      lambda$sigma2 <= prior_range$sigma2[2] &&
+    lambda$alpha_phi >= prior_range$alpha_phi[1] &&
+      lambda$alpha_phi <= prior_range$alpha_phi[2] &&
+    lambda$beta_phi >= prior_range$beta_phi[1] &&
+      lambda$beta_phi <= prior_range$beta_phi[2] &&
+    lambda$alpha_psi >= prior_range$alpha_psi[1] &&
+      lambda$alpha_psi <= prior_range$alpha_psi[2] &&
+    lambda$beta_psi >= prior_range$beta_psi[1] &&
+      lambda$beta_psi <= prior_range$beta_psi[2]
+  )
+
+  if (!inside_support) {
+    return(0)
+  }
+
+  d_theta <- 1 / (prior_range$theta[2] - prior_range$theta[1])
+  d_log_gamma <- 1 / (log(prior_range$gamma[2]) - log(prior_range$gamma[1]))
+  d_log_rho <- 1 / (log(prior_range$rho[2]) - log(prior_range$rho[1]))
+  d_log_alpha <- 1 / (log(prior_range$alpha[2]) - log(prior_range$alpha[1]))
+  d_log_sigma2 <- 1 / (log(prior_range$sigma2[2]) - log(prior_range$sigma2[1]))
+  d_log_alpha_phi <- 1 / (log(prior_range$alpha_phi[2]) - log(prior_range$alpha_phi[1]))
+  d_log_beta_phi <- 1 / (log(prior_range$beta_phi[2]) - log(prior_range$beta_phi[1]))
+  d_log_alpha_psi <- 1 / (log(prior_range$alpha_psi[2]) - log(prior_range$alpha_psi[1]))
+  d_log_beta_psi <- 1 / (log(prior_range$beta_psi[2]) - log(prior_range$beta_psi[1]))
+
+  d_theta * d_log_gamma * d_log_rho * d_log_alpha * d_log_sigma2 * 
+    d_log_alpha_phi * d_log_beta_phi * d_log_alpha_psi * d_log_beta_psi
+}
+
+# check hyperparameter vector inside support of prior
+in_prior_support <- function(lambda) {
+  prior_density(lambda) > 0
+}
+
+# 5) Simulator
+simulate_X_abc <- function(lambda, N, J, K) {
+  proposed_network <- generate_ground_truth_network(K, J, lambda, seed = NULL)
+  u_ij_ctrl <- matrix(0, nrow = N, ncol = J)
+  return(simulate_hurdle(proposed_network, N, u_ij_ctrl))
+}
+
+# 6) Mean ABC_SMC process
+
+# Convert lambda to numeric vector
+lambda_to_vec <- function(lambda) {
+  c(
+    theta = lambda$theta,
+    log_gamma = log(lambda$gamma),
+    log_rho = log(lambda$rho),
+    log_alpha = log(lambda$alpha),
+    log_sigma2 = log(lambda$sigma2),
+    log_alpha_phi = log(lambda$alpha_phi),
+    log_beta_phi = log(lambda$beta_phi),
+    log_alpha_psi = log(lambda$alpha_psi),
+    log_beta_psi = log(lambda$beta_psi)
+  )
+}
+
+# Convert back
+vec_to_lambda <- function(v) {
+  list(
+    theta = unname(v["theta"]),
+    gamma = exp(unname(v["log_gamma"])),
+    rho = exp(unname(v["log_rho"])),
+    alpha = exp(unname(v["log_alpha"])),
+    sigma2 = exp(unname(v["log_sigma2"])),
+    alpha_phi = exp(unname(v["log_alpha_phi"])),
+    beta_phi = exp(unname(v["log_beta_phi"])),
+    alpha_psi = exp(unname(v["log_alpha_psi"])),
+    beta_psi = exp(unname(v["log_beta_psi"]))
+  )
+}
+
+# Compute the weighted covariance matrix of the particles
+weighted_covariance <- function(X, w) {
+  mu <- colSums(X * w)
+  Xc <- sweep(X, 2, mu, "-")
+  crossprod(Xc * sqrt(w), Xc * sqrt(w))
+}
+
+# Stabilize covariance matrix so chol() does not fail
+make_positive_definite <- function(Sigma, min_eig = 1e-8) {
+  
+  Sigma <- as.matrix(Sigma)
+  Sigma[!is.finite(Sigma)] <- 0
+  
+  # Force symmetry
+  Sigma <- (Sigma + t(Sigma)) / 2
+  
+  eig_vals <- eigen(Sigma, symmetric = TRUE, only.values = TRUE)$values
+  min_val <- min(eig_vals, na.rm = TRUE)
+  
+  if (!is.finite(min_val)) {
+    return(diag(min_eig, nrow(Sigma)))
+  }
+  
+  if (min_val < min_eig) {
+    diag(Sigma) <- diag(Sigma) + (min_eig - min_val)
+  }
+  
+  # Force symmetry again after diagonal adjustment
+  Sigma <- (Sigma + t(Sigma)) / 2
+  
+  Sigma
+}
+
+# Compute the log density of a multivariate Gaussian distribution
+mvnorm_logpdf <- function(x, mean, Sigma) {
+  
+  Sigma <- make_positive_definite(Sigma, min_eig = 1e-8)
+  
+  p <- length(x)
+  
+  cholS <- tryCatch(
+    chol(Sigma),
+    error = function(e) {
+      chol(make_positive_definite(Sigma, min_eig = 1e-6))
+    }
+  )
+  
+  z <- backsolve(cholS, x - mean, transpose = TRUE)
+  
+  out <- -0.5 * (
+    p * log(2 * pi) +
+      2 * sum(log(diag(cholS))) +
+      sum(z^2)
+  )
+  
+  if (!is.finite(out)) {
+    return(-Inf)
+  }
+  
+  out
+}
+
+# Take one old particle and perturb it with a Gaussian random walk
+perturb_lambda <- function(lambda, Sigma_kernel) {
+  
+  Sigma_kernel <- make_positive_definite(Sigma_kernel, min_eig = 1e-8)
+  
+  v <- lambda_to_vec(lambda)
+  v_new <- as.numeric(MASS::mvrnorm(1, mu = v, Sigma = Sigma_kernel))
+  names(v_new) <- names(v)
+  
+  vec_to_lambda(v_new)
+}
+
+# Gaussian proposal density from the old particle to the new one
+kernel_density <- function(lambda_new, lambda_old, Sigma_kernel) {
+  x <- lambda_to_vec(lambda_new)
+  m <- lambda_to_vec(lambda_old)
+  exp(mvnorm_logpdf(x, m, Sigma_kernel))
+}
+
+# Diagnostics
+effective_sample_size <- function(w) {
+  1 / sum(w^2)
+}
+
+# Resampling
+resample_particles <- function(particles, weights) {
+  idx <- sample(seq_along(particles), size = length(particles), replace = TRUE, prob = weights)
+  list(
+    particles = particles[idx],
+    weights = rep(1 / length(particles), length(particles))
+  )
+}
+
+# ABC-SMC algorithm
+abc_smc <- function(S_obs, N, J, K, W, T_pop, eps_quantile, pilot_size) {
+
+  # Store the accepted populations and the epsilon for each step
+  populations <- vector("list", T_pop)
+  eps_vec <- numeric(T_pop)
+
+  # Population 1: Initial Rejection Sampling
+
+  # Run a pilot to determine epsilon_1
+  d_store <- numeric(pilot_size)
+
+  for (m in 1:pilot_size) {
+
+    # Draw hyperparameters from the prior
+    th <- sample_lambda()
+
+    # Simulate a count matrix
+    X_sim <- simulate_X_abc(th, N, J, K)
+
+    # Calculate how far the simulated stats are from the real observed stats
+    d_now <- distance_abc(summaries(X_sim), S_obs)
+
+    # Catch NAs
+    if (is.na(d_now)) d_now <- Inf
+
+    d_store[m] <- d_now
+  }
+
+  # Set the first epsilon threshold to the specified eps_quantile of the pilot distances
+  eps_vec[1] <- as.numeric(quantile(d_store, probs = eps_quantile, na.rm = TRUE))
+
+  # Generate population 1 using the first epsilon
+  particles <- vector("list", W)
+  distances <- numeric(W)
+  n_accept <- 0
+
+  # Keep proposing until we accept exactly W particles
+  while (n_accept < W) {
+
+    th <- sample_lambda()
+    X_sim <- simulate_X_abc(th, N, J, K)
+    d_now <- distance_abc(summaries(X_sim), S_obs)
+
+    # Catch NAs
+    if (is.na(d_now)) d_now <- Inf
+
+    # Accept the particle if its distance <= the threshold
+    if (d_now <= eps_vec[1]) {
+
+      n_accept <- n_accept + 1
+      particles[[n_accept]] <- th
+      distances[n_accept] <- d_now
+    }
+  }
+
+  # All accepted particles are drawn from the prior, so they get equal weights
+  weights <- rep(1 / W, W)
+
+  populations[[1]] <- list(
+    particles = particles,
+    weights = weights,
+    distances = distances,
+    distances_for_epsilon = distances
+  )
+
+  # Populations 2 to T_pop
+  if (T_pop >= 2) {
+
+    for (t in 2:T_pop) {
+
+      # Retrieve the accepted particles and weights from the previous population
+      prev_part <- populations[[t - 1]]$particles
+      prev_w <- populations[[t - 1]]$weights
+
+      # Use the original accepted distances before any ESS resampling
+      prev_distances <- populations[[t - 1]]$distances_for_epsilon
+
+      # Shrink the tolerance threshold based on the previous population
+      eps_vec[t] <- as.numeric(quantile(prev_distances, probs = eps_quantile, na.rm = TRUE))
+
+      # Calculate the covariance of the previous particles to shape perturbation kernel
+      prev_mat <- do.call(rbind, lapply(prev_part, lambda_to_vec))
+      Sigma_kernel <- 2 * weighted_covariance(prev_mat, prev_w)
+
+      # Stabilize the Gaussian proposal covariance
+      Sigma_kernel <- make_positive_definite(Sigma_kernel, min_eig = 1e-8)
+
+      # Store for the new population
+      particles_t <- vector("list", W)
+      distances_t <- numeric(W)
+      weights_t <- numeric(W)
+      n_accept <- 0
+
+      # Keep proposing until we accept exactly W particles
+      while (n_accept < W) {
+
+        # Pick an old particle, favoring those with higher weights
+        idx <- sample(seq_len(W), size = 1, prob = prev_w)
+
+        # Perturb it by adding a little Gaussian noise
+        th_star <- perturb_lambda(prev_part[[idx]], Sigma_kernel)
+
+        # If the perturbed hyperparameters fall outside our defined prior limits, reject
+        if (!in_prior_support(th_star)) next
+
+        # Simulate the data and calculate the distance
+        X_sim <- simulate_X_abc(th_star, N, J, K)
+        d_now <- distance_abc(summaries(X_sim), S_obs)
+
+        # Catch NAs
+        if (is.na(d_now)) d_now <- Inf
+
+        # Accept if it meets the new threshold
+        if (d_now <= eps_vec[t]) {
+
+          # Calculate weights for the newly accepted particle
+          # Numerator: The prior probability of the new hyperparameter
+          num <- prior_density(th_star)
+
+          # Denominator: weighted probability of proposing this new hyperparameter from any of the old particles
+          denom <- sum(prev_w * sapply(prev_part, function(old) {kernel_density(th_star, old, Sigma_kernel)}))
+
+          if (!is.finite(denom) || denom <= 0) {
+            next
+          }
+
+          n_accept <- n_accept + 1
+          particles_t[[n_accept]] <- th_star
+          distances_t[n_accept] <- d_now
+          weights_t[n_accept] <- num / denom
+        }
+      }
+
+      # Normalize weights so they sum to 1
+      weights_t <- weights_t / sum(weights_t)
+
+      # Save the original accepted distances before ESS resampling
+      accepted_distances_t <- distances_t
+
+      # If a few particles have all the weight, we resample to reset them to uniform weights
+      if (effective_sample_size(weights_t) < W / 2) {
+
+        idx_resample <- sample(seq_len(W), size = W, replace = TRUE, prob = weights_t)
+        particles_t <- particles_t[idx_resample]
+        distances_t <- distances_t[idx_resample]
+        weights_t <- rep(1 / W, W)
+      }
+
+      populations[[t]] <- list(
+        particles = particles_t,
+        weights = weights_t,
+        distances = distances_t,
+        distances_for_epsilon = accepted_distances_t
+      )
+    }
+  }
+
+  list(populations = populations)
+}
+```
+
+```{r}
+# Build symmetric J x J direct-edge mask E from delta_kj
+make_E_from_delta <- function(delta_kj, J, K) {
+  E <- diag(J)
+  
+  edge_idx <- which(delta_kj == 1, arr.ind = TRUE)
+  
+  if (nrow(edge_idx) > 0) {
+    k_idx <- edge_idx[, 1]
+    j_idx <- edge_idx[, 2]
+    
+    E[cbind(k_idx, j_idx)] <- 1
+    E[cbind(j_idx, k_idx)] <- 1
+  }
+  E
+}
+
+# Positive-definite stabilization
+make_positive_definite_capped <- function(A, min_eig = 1e-6, max_cond = 1e4) {
+  
+  A <- as.matrix(A)
+  A[!is.finite(A)] <- 0
+  A <- (A + t(A)) / 2
+  
+  eig <- eigen(A, symmetric = TRUE)
+  vals <- eig$values
+  
+  lambda_max <- max(vals, na.rm = TRUE)
+  
+  # Numerically invalid or non-positive, use a small diagonal positive-definite matrix
+  if (!is.finite(lambda_max) || lambda_max <= 0) {
+    return(diag(min_eig, nrow(A)))
+  }
+  
+  # Eigenvalue check:
+  # 1) lambda_min >= min_eig
+  # 2) lambda_max / lambda_min <= max_cond
+  eig_check <- max(min_eig, lambda_max / max_cond)
+  vals <- pmax(vals, eig_check)
+  
+  A_new <- eig$vectors %*% diag(vals, nrow = length(vals)) %*% t(eig$vectors)
+  A_new <- (A_new + t(A_new)) / 2
+  
+  A_new
+}
+
+# Omega' = Omega · E from Sigma_hat
+make_direct_omega_from_sigma <- function(Sigma_hat, E, eps = 1e-6, max_cond = 1e4) {
+  
+  J <- nrow(Sigma_hat)
+  
+  # Stabilize Sigma_hat before inversion
+  Sigma_hat <- make_positive_definite_capped(Sigma_hat, min_eig = eps, max_cond = max_cond)
+  
+  # Omega_hat = Sigma_hat^{-1}
+  Omega_hat <- tryCatch(solve(Sigma_hat), 
+                        error = function(e) matrix(NA, nrow = J, ncol = J))
+  
+  if (any(!is.finite(Omega_hat))) {
+    return(matrix(NA, nrow = J, ncol = J))
+  }
+  
+  Omega_hat <- (Omega_hat + t(Omega_hat)) / 2
+  
+  # Remove entries not supported by the direct-edge mask E
+  Omega_prime <- Omega_hat * E
+  
+  # Stabilize Omega_prime before solving Omega_prime d = u
+  Omega_prime <- make_positive_definite_capped(Omega_prime, min_eig = eps, max_cond = max_cond)
+  
+  Omega_prime
+}
+```
+
+Here we used log-normalized scale instead of raw UMI counts. Below is the normalization step:
+
+-   **Matrix Normalization:**
+
+    The raw count matrix is defined as $\mathbf Y \in \mathbb R^{N \times J}$, where $i$ indexes cells ($i = 1, \dots, N$) and $j$ indexes genes ($j = 1, \dots, J$). For each cell $i$, the library size is:
+
+    $$
+    L_i = \sum_{j=1}^{J} y_{ij}
+    $$
+
+    Each raw count is normalized by its cell-specific library size, adjusted by an offset of 1, and log-transformed:
+
+    $$
+    y^{'}_{ij} = \log\left(\frac{y_{ij}}{ L_i} + 1\right)
+    $$
+
+-   **Expected-Vector Normalization:**
+
+    For a model-based expected expression vector $\mathbf{x}=(x_1,\dots,x_J)$, the same logic is applied by treating the vector as a single pseudo-cell. Its total library size is calculated as:
+
+    $$
+    L = \sum_{j=1}^{J} x_j
+    $$
+
+    The normalized expected vector value for each gene $j$ is then derived using an offset of 1:
+
+    $$
+    x^{'}_{j} = \log\left(\frac{x_{j}}{L} + 1\right)
+    $$
+
+Because the estimators produce predictions on the log-normalized scale, the predicted vector must be transformed back to the linear expression scale before comparison with the model-based expected raw count vector.
+
+Starting from the normalized expected expression,
+
+$$
+x'_j=\log\left(\frac{x_j}{L}+1\right)
+$$
+
+$$
+\exp(x'_j)=\frac{x_j}{L}+1
+$$
+
+$$
+\exp(x'_j)-1=\frac{x_j}{L}
+$$
+
+Because some values of $\exp(\hat{x}'_j)-1$ may be negative, we impose non-negativity using $\max\left\{\exp(\hat{x}'_j)-1, 0\right\}$.
+
+For a valid expression composition, the relative expression proportions should sum to one, so we normalize the non-negative exponentiated values by their total sum across all $J$ genes:
+
+$$
+\frac{\max\left\{\exp(\hat{x}'_j)-1, 0\right\}}{\sum_{\ell=1}^{J}\max\left\{\exp(\hat{x}'_\ell)-1, 0\right\}}.
+$$
+
+To restore the prediction to the raw expression scale, we use the model-based expected library size under perturbation $\tilde g$,
+
+$$
+L^{(\tilde g)} = \sum_{j=1}^{J}x_j^{(\tilde g)}.
+$$
+
+The predicted raw expression for gene $j$ is then obtained by scaling the normalized proportion by the perturbed library size:
+
+$$
+\hat{x}_j^{(\tilde g)} = L^{(\tilde g)} \frac{\max\left\{\exp(\hat{x}'_j)-1, 0\right\}}{\sum_{\ell=1}^{J} \max\left\{\exp(\hat{x}'_\ell)-1, 0\right\}}.
+$$
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, include = FALSE}
+# Evaluation metric for raw perturbed count X
+X_correlation <- function(x_g_true, X_g_hat) {
+
+  x_g_true <- as.numeric(x_g_true)
+  X_g_hat <- as.numeric(X_g_hat)
+
+  # Return NA if there are NAs, NaNs, or infinite values or either vector has zero variance
+  if (any(!is.finite(X_g_hat)) || any(!is.finite(x_g_true))) {return(NA)}
+  if (sd(x_g_true) == 0 || sd(X_g_hat) == 0) {return(NA)}
+
+  cor(x_g_true, X_g_hat)
+}
+
+# Run Benchmark 1
+run_benchmark1 <- function(network, n_grid, s_grid, n_rep) {
+  
+  J <- network$J
+  K <- network$K
+
+  E_direct <- make_E_from_delta(delta_kj = network$delta_kj, J = J, K = K)
+
+  results <- list()
+  idx <- 1
+  
+  # Every single regulator gene is tested exactly an equal number of times
+  target_by_rep <- sample(rep(seq_len(K), length.out = n_rep))
+  
+  # ExprSim ABC (no true lambda) gets an estimated network for each replicate
+  net_seed_by_rep <- 100000 + seq_len(n_rep)
+  
+  # Iterate over sample sizes
+  for (n in n_grid) {
+    
+    # Run replicates for each sample size
+    for (rep in seq_len(n_rep)) {
+
+      # Generate unperturbed control data Y^(0)
+      n_ctrl <- round(n * 20)
+      u_ij_ctrl <- matrix(0, nrow = n_ctrl, ncol = J)
+      
+      # Simulate raw UMI counts for the training set and validation set
+      Y_0_counts <- simulate_hurdle(network, N = n_ctrl, u_ij = u_ij_ctrl)
+      Y_val_counts <- simulate_hurdle(network, N = n_ctrl, u_ij = u_ij_ctrl)
+
+      # Everything uses log-normalized expression
+      Y_0 <- normalize_count_data(Y_0_counts, offset = 1)
+      Y_val <- normalize_count_data(Y_val_counts, offset = 1)
+      
+      # Calculate summary statistics on log-normalized data
+      S_obs <- summaries(Y_0_counts)
+      
+      # Run the ABC-SMC algorithm to estimate lambda
+      cat(sprintf("\n[BM1 ABC-SMC] J=%d | n_ctrl=%d | rep=%d | n_pert=%d ... ", 
+                  J, n_ctrl, rep, n))
+      smc_fit <- abc_smc(S_obs, N = n_ctrl, J = J, K = K, 
+                         W=50, T_pop=5, eps_quantile=0.25, pilot_size=500)
+      cat("Done.\n")
+      
+      # Extract the final ABC population
+      final_pop <- smc_fit$populations[[length(smc_fit$populations)]]
+      
+      # Calculate the weighted posterior mean for the estimated lambda parameters
+      lambda_matrix <- do.call(rbind, lapply(final_pop$particles, function(th) {
+        c(theta = th$theta, gamma = th$gamma, rho = th$rho, alpha = th$alpha,
+          sigma2 = th$sigma2, alpha_phi = th$alpha_phi, beta_phi = th$beta_phi,
+          alpha_psi = th$alpha_psi, beta_psi = th$beta_psi)
+      }))
+      mean_lambda_est <- colSums(lambda_matrix * final_pop$weights)
+      lambda_est <- as.list(mean_lambda_est)
+
+      # CIPHER, precision estimators use Y^(0)
+      Sigma_hat <- cov(Y_0)
+      
+      # CIPHER-DirectSigma
+      Omega_hat_prime <- make_direct_omega_from_sigma(Sigma_hat = Sigma_hat, E = E_direct,
+                                                      eps = 1e-6, max_cond = 1e4)
+
+      sgl_fit <- precision_estimators(Y_0, Y_val, method = "sglasso")
+      scl_fit <- precision_estimators(Y_0, Y_val, method = "sclime")
+      gel_fit <- precision_estimators(Y_0, Y_val, method = "gelnet")
+      
+      Omega_sgl <- sgl_fit$Omega_opt
+      Omega_sgl <- make_positive_definite_capped(sgl_fit$Omega_opt, 
+                                                 min_eig = 1e-6, max_cond = 1e4)
+      
+      Omega_scl <- scl_fit$Omega_opt
+      Omega_scl <- make_positive_definite_capped(scl_fit$Omega_opt, 
+                                                 min_eig = 1e-6, max_cond = 1e4)
+
+      Sigma_gel <- gel_fit$Sigma_opt
+      
+      # Generate estimated network from ABC posterior mean
+      net_est <- generate_ground_truth_network(K, J, lambda_est, seed = net_seed_by_rep[rep])
+      
+      # Randomly pick one regulator target for this replicate
+      g_target <- target_by_rep[rep]
+      
+      # Model-based expected raw control count vector X^(0)
+      x_0_raw <- expected_x_g(network = network, g_target = NULL, s = 0, Q = 1000)
+      x_0 <- expected_to_log(x_0_raw, offset = 1)
+
+      # Iterate through knockdown strengths
+      for (s in s_grid) {
+        
+        cat(sprintf("  -> s=%.1f | Estimators:", s))
+        
+        # Model-based ground truth: expected raw perturbed count vector x^(g)
+        x_g_true_raw <- expected_x_g(network = network, g_target = g_target, s = s, Q = 1000)
+        
+        # Library size for converting log predictions back to linear UMI scale
+        library_size <- sum(x_g_true_raw)
+        
+        # Construct perturbation vector
+        u_g <- rep(0, J)
+        u_g[g_target] <- s
+        
+        cat(" CIPHER ")
+        d_hat_cipher <- as.numeric(Sigma_hat %*% u_g)
+        X_g_hat_cipher <- x_0 + d_hat_cipher
+        
+        cat(" CIPHER-DirectSigma ")
+        d_hat_cipher_direct <- tryCatch(as.numeric(solve(Omega_hat_prime, u_g)),
+                                        error = function(e) rep(NA, J))
+        X_g_hat_cipher_direct <- x_0 + d_hat_cipher_direct
+
+        cat(" SGLASSO ")
+        d_hat_sgl <- tryCatch(as.numeric(solve(Omega_sgl, u_g)), 
+                              error = function(e) rep(NA, J))
+        X_g_hat_sgl <- x_0 + d_hat_sgl
+        
+        cat(" SCLIME ")
+        d_hat_scl <- tryCatch(as.numeric(solve(Omega_scl, u_g)), 
+                              error = function(e) rep(NA, J))
+        X_g_hat_scl <- x_0 + d_hat_scl
+        
+        cat(" GELNET ")
+        d_hat_gel <- as.numeric(Sigma_gel %*% u_g)
+        X_g_hat_gel <- x_0 + d_hat_gel
+        
+        cat(" ExprSim ABC ")
+        X_g_hat_abc <- expected_x_g(network = net_est, g_target = g_target, s = s, Q = 1000)
+        X_g_hat_abc <- expected_to_log(X_g_hat_abc, offset = 1)
+        
+        cat(" ExprSim + lambda ")
+        X_g_hat_true <- expected_x_g(network = network, g_target = g_target, s = s, Q = 1000)
+        X_g_hat_true <- expected_to_log(X_g_hat_true, offset = 1)
+        
+        cat(" scGPT ")
+        X_g_hat_scgpt <- run_scgpt(network = network, Y_0 = Y_0, n_pert = n, 
+                                   g_target = g_target, s = s, n = n, rep = rep)
+        
+        cat(" Rhaister ")
+        d_hat_rhaister <- run_rhaister(network = network, x_0 = x_0, 
+                                       g_target = g_target, s = s, N = n,
+                                       panel_genes = setdiff(seq_len(K), g_target),
+                                       ref_context = 5)
+        X_g_hat_rhaister <- x_0 + d_hat_rhaister
+        
+        # Convert log-scale predictions back to linear UMI scale for evaluation
+        X_g_hat_cipher_raw <- expected_log_to_raw(X_g_hat_cipher, L = library_size)
+        X_g_hat_cipher_direct_raw <- expected_log_to_raw(X_g_hat_cipher_direct, 
+                                                         L = library_size)
+        X_g_hat_sgl_raw <- expected_log_to_raw(X_g_hat_sgl, L = library_size)
+        X_g_hat_scl_raw <- expected_log_to_raw(X_g_hat_scl, L = library_size)
+        X_g_hat_gel_raw <- expected_log_to_raw(X_g_hat_gel, L = library_size)
+        X_g_hat_abc_raw <- expected_log_to_raw(X_g_hat_abc, L = library_size)
+        X_g_hat_true_raw <- expected_log_to_raw(X_g_hat_true, L = library_size)
+        X_g_hat_scgpt_raw <- expected_log_to_raw(X_g_hat_scgpt, L = library_size)
+        X_g_hat_rhaister_raw <- expected_log_to_raw(X_g_hat_rhaister, L = library_size)
+        
+        # Evaluation
+        predictions <- list(X_g_hat_cipher_raw, X_g_hat_cipher_direct_raw,
+                            X_g_hat_sgl_raw, X_g_hat_scl_raw,
+                            X_g_hat_gel_raw, X_g_hat_abc_raw, X_g_hat_true_raw,
+                            X_g_hat_scgpt_raw, X_g_hat_rhaister_raw)
+        
+        methods <- c("CIPHER", "CIPHER-DirectSigma", "SGLASSO", "SCLIME", "GELNET",
+                     "ExprSim ABC", "ExprSim + lambda","scGPT", "Rhaister")
+        
+        # Calculate metrics for each method
+        for(m_idx in seq_along(methods)) {
+          corr_val <- X_correlation(x_g_true_raw, predictions[[m_idx]])
+
+          results[[idx]] <- data.frame(n = n, s = s, rep = rep, target_gene = g_target,
+                                       method = methods[m_idx], corr = corr_val)
+          idx <- idx + 1
+        }
+        cat("Done.\n")
+      }
+    }
+  }
+
+  dplyr::bind_rows(results)
+}
+
+unlink("results/scgpt_bm1", recursive = TRUE)
+
+# Execute
+set.seed(456)
+bm1_results <- run_benchmark1(
+  network = ground_truth, 
+  n_grid = c(5, 20, 50), 
+  s_grid = c(0.5, 0.9, 1),
+  n_rep = 50
+)
+```
+
+```{r}
+# Plotting
+plot_bm1_correlation <- function(df) {
+
+  method_order <- c("CIPHER", "CIPHER-DirectSigma", "SGLASSO", "SCLIME", "GELNET", 
+                    "ExprSim ABC", "ExprSim + lambda", "scGPT", "Rhaister")
+
+  plot_df <- df %>%
+    mutate(n_factor = factor(n), method = factor(method, levels = method_order))
+
+  # Calculate mean correlation and standard deviation across replicates
+  summary_df <- plot_df %>%
+    group_by(n, n_factor, s, method) %>%
+    summarise(mean_corr = mean(corr, na.rm = TRUE), sd_corr = sd(corr, na.rm = TRUE), 
+              .groups = "drop") %>%
+    mutate(sd_corr = ifelse(is.na(sd_corr), 0, sd_corr))
+
+  pd_rep <- position_jitterdodge(jitter.width = 0.15, dodge.width = 0.75)
+  pd_mean <- position_dodge(width = 0.75)
+
+  # Plot individual replicates, mean, and mean +/- SD
+  ggplot(plot_df, aes(x = n_factor, y = corr, color = method)) +
+
+    # Individual replicates
+    geom_point(position = pd_rep, size = 1.5, alpha = 0.15, na.rm = TRUE) +
+
+    # Mean +/- SD
+    geom_errorbar(data = summary_df,
+                  aes(x = n_factor, ymin = mean_corr - sd_corr, ymax = mean_corr + sd_corr, color = method),
+                  width = 0.25, linewidth = 0.8, position = pd_mean,
+                  inherit.aes = FALSE, na.rm = TRUE) +
+
+    # Mean
+    geom_errorbar(data = summary_df,
+                  aes(x = n_factor, ymin = mean_corr, ymax = mean_corr, color = method),
+                  width = 0.5, linewidth = 1.2, position = pd_mean,
+                  inherit.aes = FALSE, na.rm = TRUE) +
+
+    scale_color_discrete(drop = FALSE) +
+
+    facet_wrap(~ s, labeller = label_both) +
+
+    labs(title = "Benchmark 1 (log-scale): Correlation",
+         subtitle = paste0("J = 200, K = 10, n = perturbed sample size, ", 
+                           "control size = 20n, s = knockdown strength"),
+         x = "Perturbed sample size (n)",
+         y = "Correlation",
+         color = "Estimator") +
+
+    theme_classic(base_size = 14) +
+    theme(legend.position = "bottom")
+}
+
+io::qdraw(plot_bm1_correlation(bm1_results), width = 7, height = 5)
+```

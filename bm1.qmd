@@ -1,0 +1,1734 @@
+---
+title: "Benchmark 1"
+format: html
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE) 
+suppressPackageStartupMessages({
+  library(scuttle)
+  library(Matrix)
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(glassoFast)
+  library(clime)
+  library(SpatialNP)
+  library(GLassoElnetFast)
+  library(MASS)
+  library(jsonlite)
+  library(reticulate)
+  library(io)
+})
+```
+
+## **1. Simulator Model**
+
+### **1.1 Overview**
+
+Hyperparameters: $$
+\lambda=(\theta,\gamma,\rho,\alpha,\sigma^2,\alpha_\psi,\beta_\psi,\alpha_\phi,\beta_\phi).
+$$
+
+Let the total number of genes be $J$, where genes $1,\dots,K$ are transcription factors (TFs) that act as regulators. All $J$ genes may serve as regulatory targets, while genes $K+1,\dots,J$ are non-TF genes.
+
+Let $u_{ij} \in [0, 1]$ act as the continuous perturbation indicator for gene $j$ in cell $i$, representing the degree of knockdown. Within each simulation, compute the perturbation-aware regulatory means:
+
+$$
+m_{ij}=\exp\left(\sum_{k=1}^K \beta_{ikj}^{\prime}a_{ik}\right) 
+$$ with TF activities of regulator $k$:\
+$$
+a_{ik}\sim\text{Gamma}(\alpha,\alpha)
+$$ and regulatory effect $$
+\beta_{ikj}^{\prime} = \beta_{kj} \ (1 - u_{ik}), \quad \beta_{kj}= \delta_{kj} \dot{\beta}_{kj}, \quad \dot{\beta}_{kj}\sim\mathcal N(0,\sigma^2).
+$$
+
+$$
+\delta_{kj}\mid\psi_k,\phi_j \sim\operatorname{Bernoulli}(\psi_k\phi_j), \quad \psi_k \sim\operatorname{Beta}(\alpha_\psi,\beta_\psi), \quad \phi_j \sim\operatorname{Beta}(\alpha_\phi,\beta_\phi)
+$$
+
+Define gene-specific gene-on probabilities: $$
+\pi_j\sim \text{Beta}(\theta,\ (1-\theta)),\quad \theta \in (0,1)
+$$ Then, generating the latent state and applying the target perturbation mask: $$
+v_{ij} \ | \ \pi_j\sim \text{Bernoulli}(\pi_j),\qquad z_{ij}= \begin{cases} 0,& v_{ij}=0\\ \text{Gamma}(m_{ij}\gamma,\gamma),& v_{ij}=1 \end{cases}, \qquad z_{ij}^{\prime} = z_{ij} \ (1 - u_{ij})
+$$ $$
+t_{ij}\sim\text{Gamma}(\rho,\rho),\qquad x_{ij}\mid z_{ij}^{\prime},t_{ij}\sim\text{Poisson}(t_{ij}z_{ij}^{\prime})
+$$
+
+### **1.2 Biological Model for Latent True Expression** $z_{ij}$
+
+#### **1.2.1 Regulatory model for** $m_{ij}$
+
+To account for continuous perturbations, we define a cell-specific masked regulatory effect $\beta_{ikj}^{\prime}$: $$
+\beta_{ikj}^{\prime} = \beta_{kj} \  (1 - u_{ik}), \quad i=1, \dots, N.
+$$
+
+This ensures that if regulator $k$ is partially or fully knocked down in cell $i$, its regulatory effect on downstream genes scales proportionally. We then define the regulatory mean as:
+
+$$
+m_{ij}=\exp\left(\sum_{k=1}^K \beta_{ikj}^{\prime}a_{ik}\right)  
+$$
+
+with:
+
+-   $a_{ik}\ge 0$ denoting the TF activities of regulator $k$ in cell $i$, such that: $$
+      a_{ik}\sim \text{Gamma}(\alpha,\alpha)\quad\Rightarrow\quad \mathbb E[a_{ik}]=1,\ \quad \text{Var}(a_{ik})=\frac{1}{\alpha}.
+    $$
+
+-   $\delta_{kj}$ denoting the binary adjacency matrix, such that:
+
+    $$
+    \delta_{kj}\mid\psi_k,\phi_j \sim\operatorname{Bernoulli}(\psi_k\phi_j),
+    $$
+
+    where the regulator-specific and target-specific edge propensities satisfy $$\psi_k\sim\operatorname{Beta}(\alpha_\psi,\beta_\psi),
+    \qquad k=1,\ldots,K, \quad \text{and} \quad \phi_j\sim\operatorname{Beta}(\alpha_\phi,\beta_\phi),
+    \qquad j=1,\ldots,J.$$
+
+    Here,
+
+    $$
+    \delta_{kj} = \begin{cases} 1, & \text{regulator } k \text{ regulates target } j, \\ 0, & \text{otherwise.} \end{cases}
+    $$
+
+-   $\dot{\beta}_{kj}$ denoting the signed regulatory effect of regulator $k$ on gene $j$, such that: $$
+    \dot{\beta}_{kj}\sim\mathcal N(0,\sigma^2).
+    $$
+
+    This yields the regulatory effect: $$
+    \beta_{kj}= \delta_{kj}\dot{\beta}_{kj}
+    $$
+
+#### **1.2.2 On/Off States** $v_{ij}$ **and Perturbation Scaling**
+
+We conceptualize the latent true expression $z_{ij}^{\prime}$ as being governed by the intersection of a binary biological switch and a continuous experimental knockdown. This ensures that a gene only displays expression if it is biologically on, and that the magnitude of this expression is modulated by the efficiency of the CRISPR perturbation.
+
+##### **1.2.2.1 The Biological Switch (**$v_{ij}$**)**
+
+This represents the natural transcriptional state of gene $j$ in cell $i$. We introduce a global hyperparameter $\theta \in (0,1)$ to define the gene-specific on-probability $\pi_j$:
+
+$$
+\pi_j\sim \text{Beta}(\theta,\ (1-\theta))\quad\Rightarrow\quad \mathbb E[\pi_j]=\theta,\ \quad 
+\mathrm{Var}(\pi_j)=\frac{\theta(1-\theta)}{2}.
+$$
+
+The biological state is then sampled as:
+
+$$
+v_{ij}\sim \mathrm{Bernoulli}(\pi_j).
+$$
+
+-   $v_{ij} = 1$: The gene is biologically on.
+
+-   $v_{ij} = 0$: The gene is biologically off.
+
+##### **1.2.2.2 The Perturbation Scaling (**$u_{ij}$**)**
+
+Unlike a binary knockout, the experimental intervention is modeled as a continuous knockdown fraction $u_{ij} \in [0, 1]$. This represents the proportion of expression lost due to the perturbation:
+
+-   $u_{ij} = 0$: No perturbation (100% of biological activity remains).
+
+-   $0 < u_{ij} < 1$: Partial knockdown (e.g., $u_{ij} = 0.9$ implies 10% residual activity).
+
+-   $u_{ij} = 1$: Complete knockout (0% of biological activity remains).
+
+##### **1.2.2.3 Latent Expression Logic**
+
+To implement the perturbation on the target gene, we define the masked latent expression $z_{ij}^{\prime}$ by scaling the theoretical biological latent state $z_{ij}$ by the residual activity $(1 - u_{ij})$:
+
+1.  Case 1: $z_{ij}^{\prime} = 0$ if $v_{ij} = 0$
+
+    If the biological switch is off, the gene cannot be expressed regardless of the perturbation state.
+
+$$
+\Pr(z_{ij}^{\prime}=0\mid v_{ij}=0)=1,\qquad \Pr(z_{ij}^{\prime}\neq 0\mid v_{ij}=0)=0
+$$
+
+2.  Case 2: $z_{ij}^{\prime} \ge 0$ if $v_{ij} = 1$
+
+    If the gene is biologically on, its latent expression is sampled from a Gamma distribution centered around the regulatory mean $m_{ij}$, then scaled by the knockdown factor $(1 - u_{ij})$:
+
+    $$
+    z_{ij}^{\prime}\mid (v_{ij}=1)\ \sim\ \text{Gamma}(m_{ij}\gamma,\ \gamma) \ (1 - u_{ij})
+    $$
+
+    where $\gamma > 0$ represents biological variability. Under this parameterization, the conditional mean and variance of the masked expression are:
+
+$$
+\mathbb{E}[z_{ij}^{\prime}\mid v_{ij}=1]=m_{ij}(1 - u_{ij}),\qquad \text{Var}(z_{ij}^{\prime}\mid v_{ij}=1)=\frac{m_{ij}(1 - u_{ij})^2}{\gamma}.
+$$
+
+### **1.3 Observed scRNA-seq Count** $x_{ij}$
+
+We map the masked latent true expression $z_{ij}^{\prime}$ to the observed UMI count: $$
+x_{ij}\mid z_{ij}^{\prime},t_{ij}\sim\text{Poisson}(t_{ij}z_{ij}^{\prime})
+$$ with $t_{ij}$ denoting technical variability, which is modeled by a Gamma prior: $$
+  t_{ij}\sim\text{Gamma}(\rho,\rho)\quad\Rightarrow\quad 
+  \mathbb{E}[t_{ij}] = 1,\qquad \mathrm{Var}(t_{ij}) = \frac{1}{\rho}. 
+$$
+
+Here, $\rho$ controls the magnitude of the technical noise. Because the perturbation is directly baked into $z_{ij}^{\prime}$, any cell where a gene is knocked out will have $z_{ij}^{\prime}=0$. Consequently, the Poisson rate ($t_{ij} \cdot 0$) becomes exactly 0, guaranteeing that the observed UMI count $x_{ij} = 0$ for that knockout target.
+
+```{r}
+# Hurdle Simulator
+simulate_hurdle <- function(network, N, u_ij) {
+  K <- network$K
+  J <- network$J
+  lambda <- network$lambda
+  
+  # TF activities: a_ik ~ Gamma(alpha, alpha)
+  a_ik <- matrix(rgamma(N * K, shape = lambda$alpha, rate = lambda$alpha), nrow = N, ncol = K)
+  
+  # Experimental Knockdown on targets (1 - u_ij)
+  knockdown <- 1 - u_ij 
+  
+  # Scale TF activity if the knocked-down gene is a regulator
+  a_ik_masked <- a_ik
+  if(ncol(u_ij) >= K) {
+      a_ik_masked <- a_ik * knockdown[, 1:K]
+  }
+  
+  # Compute regulatory mean m_ij
+  m_ij <- exp(a_ik_masked %*% network$beta_kj)
+  
+  # Biological Switch: v_ij ~ Bernoulli(pi_j)
+  v_ij <- matrix(rbinom(N * J, size = 1, prob = rep(network$pi_j, each = N)), 
+                 nrow = N, ncol = J)
+  
+  # Latent True Expression: z_ij
+  z_ij <- matrix(0, nrow = N, ncol = J)
+  idx_on <- which(v_ij == 1, arr.ind = TRUE)
+  
+  if (nrow(idx_on) > 0) {
+    shape_vec <- m_ij[idx_on] * lambda$gamma
+    z_ij[idx_on] <- rgamma(nrow(idx_on), shape = shape_vec, rate = lambda$gamma)
+  }
+  
+  # Apply target perturbation mask: z'_ij = z_ij * (1 - u_ij)
+  z_ij_prime <- z_ij * knockdown
+  
+  # Marginalize t_ij:
+  # t_ij ~ Gamma(rho, rho), x_ij | t_ij, z'_ij ~ Poisson(t_ij z'_ij)
+  # implies x_ij | z'_ij ~ Negative Binomial(size = rho, mean = z'_ij)
+  x_ij <- matrix(rnbinom(N * J, size = lambda$rho, 
+                         mu = as.vector(z_ij_prime)), nrow = N, ncol = J)
+  
+  return(x_ij)
+}
+```
+
+## **2. Ground Truth**
+
+We fixed a ground-truth hyperparameter set $\lambda_{\text{best}}$ obtained from the weighted posterior mean of the accepted particles in the final population of our ABC-SMC calibration on the Norman (2019) control cells.
+
+The fixed ground truth hyperparameters are:
+
+-   Global gene-on probability $\theta = 0.2489$
+-   Biological inverse variability $\gamma = 10.3517$
+-   Technical inverse variability $\rho = 28.5281$
+-   TF activity inverse variability $\alpha = 7.1634$
+-   Regulatory effect variance $\sigma^2 = 0.0978$
+-   Target-specific edge-propensity Beta shape hyperparameter $\alpha_\phi = 0.1914$
+-   Target-specific edge-propensity Beta shape hyperparameter $\beta_\phi = 1.2413$
+-   Regulator-specific edge-propensity Beta shape hyperparameter $\alpha_\psi = 1.6427$
+-   Regulator-specific edge-propensity Beta shape hyperparameter $\beta_\psi = 0.9929$
+
+To avoid a ground truth based on noisy sample shifts, we use a model-based expected raw perturbed count under a specific perturbation on gene $\tilde{g}$ :
+
+$$
+x_{j}^{(\tilde{g})} = \mathbb{E}_{x_{ij},t_{ij},z_{ij},v_{ij},a_{ik}} \left[ x_{ij}^{(\tilde{g})} \right]
+$$
+
+Now, we will start to derive this equation. Since $x_{ij}^{(\tilde{g})} \mid z_{ij}^{\prime(\tilde{g})},t_{ij} \sim \mathrm{Poisson}\left(t_{ij}z_{ij}^{\prime(\tilde{g})}\right)$,
+
+$$\mathbb{E}_{x_{ij}} \left[ x_{ij}^{(\tilde{g})} \mid z_{ij}^{\prime(\tilde{g})},t_{ij} \right] = t_{ij}z_{ij}^{\prime(\tilde{g})}.$$
+
+Now take the expectation over $t_{ij}$. Since $t_{ij} \sim \mathrm{Gamma}(\rho,\rho)$ and $\mathbb{E}[t_{ij}] = 1$, we get:
+
+$$
+ \mathbb{E}_{x_{ij},t_{ij}} \left[ x_{ij}^{(\tilde{g})} \mid z_{ij}^{\prime(\tilde{g})} \right] = \mathbb{E}_{t_{ij}} \left[ \mathbb{E}_{x_{ij}} \left[ x_{ij}^{(\tilde{g})} \mid z_{ij}^{\prime(\tilde{g})}, t_{ij} \right] \right] =  z_{ij}^{\prime(\tilde{g})} \cdot \mathbb{E}_{t_{ij}} [ t_{ij} ]  = z_{ij}^{\prime(\tilde{g})}.
+$$
+
+Since $z_{ij} \mid v_{ij}=1 \sim \mathrm{Gamma}(m_{ij}\gamma,\gamma)$, $\mathbb{E}[z_{ij} \mid v_{ij}=1,a_{ik}] = m_{ij}$. Because a gene can be either on ($v_{ij}=1$) or off ($v_{ij}=0$) and $v_{ij} \sim \mathrm{Bernoulli}(\pi_j)$,
+
+$$
+\mathbb{E}_{z_{ij}, v_{ij}}[z_{ij}^{(\tilde{g})} \mid a_{ik}] = \mathbb{E}[z_{ij}^{(\tilde{g})} \mid v_{ij}=1, a_{ik}] \cdot P(v_{ij}=1) + \mathbb{E}[z_{ij}^{(\tilde{g})} \mid v_{ij}=0, a_{ik}] \cdot P(v_{ij}=0)
+$$
+
+$$
+= (m_{ij}^{(\tilde{g})} \cdot \pi_j) + (0 \cdot (1-\pi_j)) = \pi_jm_{ij}^{(\tilde{g})}
+$$
+
+Now, since $z_{ij}^{\prime(\tilde{g})} = z_{ij}^{(\tilde{g})}(1-u_{ij})$,
+
+$$
+\mathbb{E}_{z_{ij}, v_{ij}} \left[ z_{ij}^{\prime(\tilde{g})} \mid a_{ik} \right] = (1-u_{ij}) \cdot \mathbb{E}_{z_{ij}, v_{ij}} \left[ z_{ij}^{(\tilde{g})} \mid a_{ik} \right] = \pi_j(1-u_{ij})m_{ij}^{(\tilde{g})}.
+$$
+
+Plugging it back,
+
+$$
+\mathbb{E}_{x_{ij}, t_{ij}, z_{ij}, v_{ij}} \left[ x_{ij}^{(\tilde{g})} \mid a_{ik} \right] = \mathbb{E}_{z_{ij}, v_{ij}} \left[ {\mathbb{E}_{x_{ij}, t_{ij}} \left[ x_{ij}^{(\tilde{g})} \mid z_{ij}^{\prime(\tilde{g})} \right]} \mid a_{ik} \right] = \mathbb{E}_{z_{ij}, v_{ij}} \left[ z_{ij}^{\prime(\tilde{g})} \mid a_{ik} \right] = \pi_j(1-u_{ij})m_{ij}^{(\tilde{g})}.
+$$
+
+We know that $m_{ij}^{(\tilde{g})} = \exp\left(\sum_{k=1}^{K} \beta_{kj}^{\prime} a_{ik}\right) = \exp\left(\sum_{k=1}^{K} \beta_{kj}(1-u_k)a_{ik}\right)$, so
+
+$$
+\mathbb{E}_{a_{ik}} \left[ m_{ij}^{(\tilde{g})} \right] = \mathbb{E}_{a_{ik}} \left[ \exp\left(\sum_{k=1}^{K} \beta_{kj}(1-u_k)a_{ik}\right) \right].
+$$
+
+If gene $\tilde{g}$ was knocked down with strength $s$, then
+
+$$
+u_k = \begin{cases} s, & k=\tilde{g} \\ 0, & k \neq \tilde{g} \end{cases}, \quad u_j = \begin{cases} s, & j=\tilde{g} \\ 0, & j \neq \tilde{g} \end{cases}
+$$
+
+Thus, the perturbed regulatory mean is
+
+$$
+m_{ij}^{(\tilde{g})} = \exp\left(\beta_{\tilde{g} j}(1-s)a_{i\tilde{g}}+\sum_{k \neq \tilde{g}} \beta_{kj}a_{ik}\right)
+$$
+
+Therefore, the ground truth becomes
+
+$$
+{x_{j}^{(\tilde{g})} = \mathbb{E}_{x_{ij},t_{ij},z_{ij},v_{ij},a_{ik}} \left[ x_{ij}^{(\tilde{g})} \right] = \pi_j(1-u_{ij}) \mathbb{E}_{a_{ik}} \left[ m_{ij}^{(\tilde{g})} \right]}
+$$
+
+$$
+{ = \pi_j (1-s\mathbf{1}\{j=\tilde g\}) \mathbb{E}_{a_{ik}} \left[ \exp\left( \beta_{\tilde{g} j}(1-s)a_{i\tilde{g}} + \sum_{k \neq \tilde{g}} \beta_{kj}a_{ik} \right) \right]}.
+$$
+
+To estimate the expectation over $a_{ik}$, we simulate many $a_{ik}$ samples $Q$ and average:
+
+$$ x_j^{(\tilde{g})} \approx \pi_j (1-s\mathbf{1}\{j=\tilde g\}) \frac{1}{Q} \sum_{i=1}^{Q} \exp\left(\beta_{\tilde{g} j}(1-s)a_{i\tilde{g}}+\sum_{k \neq \tilde{g}} \beta_{kj}a_{ik}  \right). $$
+
+```{r}
+# Ground Truth (Posterior Mean)
+lambda_best <- list(
+  theta = 0.2489,
+  gamma = 10.3517,
+  rho = 28.5281,
+  alpha = 7.1634,
+  sigma2 = 0.0978,
+  alpha_phi = 0.1914,
+  beta_phi = 1.2413,
+  alpha_psi = 1.6427,
+  beta_psi = 0.9929
+)
+
+generate_ground_truth_network <- function(K, J, lambda, seed = NULL) {
+  
+  old_seed_exists <- exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+  
+  if (!is.null(seed)) {
+    if (old_seed_exists) {
+      old_seed <- get(".Random.seed", envir = .GlobalEnv)
+    }
+    
+    set.seed(seed)
+    
+    on.exit({
+      if (old_seed_exists) {
+        assign(".Random.seed", old_seed, envir = .GlobalEnv)
+      } else if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
+        rm(".Random.seed", envir = .GlobalEnv)
+      }
+    }, add = TRUE)
+  }
+  
+  # Gene-specific on-probabilities pi_j ~ Beta(theta, 1-theta)
+  pi_j <- rbeta(J, shape1 = lambda$theta, shape2 = 1 - lambda$theta)
+  
+  # Regulatory effects beta_dot_kj ~ N(0, sigma^2) for K regulators to J targets
+  beta_dot_kj <- matrix(rnorm(K * J, mean = 0, sd = sqrt(lambda$sigma2)), nrow = K, ncol = J)
+  
+  # Target-specific edge propensity
+  phi_j <- rbeta(J, shape1 = lambda$alpha_phi, shape2 = lambda$beta_phi)
+  
+  # Regulator-specific edge propensity
+  psi_k <- rbeta(K, shape1 = lambda$alpha_psi, shape2 = lambda$beta_psi)
+  
+  # Edge probability
+  prob_kj <- outer(psi_k, phi_j, "*")
+  
+  # Binary adjacency matrix
+  delta_kj <- matrix(rbinom(K*J, size = 1, prob = as.vector(prob_kj)), nrow = K, ncol = J)
+  
+  # Unmasked regulatory effect beta_kj = beta_dot_kj * delta_kj
+  beta_kj <- beta_dot_kj * delta_kj
+  
+  list(beta_kj = beta_kj, delta_kj = delta_kj,  phi_j = phi_j, psi_k = psi_k, 
+       pi_j = pi_j, lambda = lambda, K = K, J = J)
+}
+
+J_sim <- 200
+K_sim <- 10
+ground_truth <- generate_ground_truth_network(K = K_sim, J = J_sim, lambda = lambda_best, seed = 123)
+
+# Model-based expected raw count vector x_j^(g)
+expected_x_g <- function(network, g_target = NULL, s = 0, Q = 1000) {
+  
+  K <- network$K
+  J <- network$J
+  lambda <- network$lambda
+  
+  # Simulate many TF activity samples a_ik
+  a_ik <- matrix(rgamma(Q * K, shape = lambda$alpha, rate = lambda$alpha), nrow = Q, ncol = K)
+  
+  # Regulator knockdown u_k
+  u_k <- rep(0, K)
+  
+  # Target expression knockdown u_j
+  u_j <- rep(0, J)
+  
+  if (!is.null(g_target)) {
+    u_j[g_target] <- s
+    
+    if (g_target <= K) {
+      u_k[g_target] <- s
+    }
+  }
+  
+  # Apply regulator perturbation inside m_ij
+  beta_masked <- sweep(network$beta_kj, 1, 1 - u_k, "*")
+  
+  # E_a[m_ij^(g)]
+  m_mat <- exp(a_ik %*% beta_masked)
+  E_m <- colMeans(m_mat)
+  
+  # x_j^(g) = pi_j(1-u_{ij}) E_a[m_ij^(g)]
+  X_g <- network$pi_j * (1 - u_j) * E_m
+  
+  X_g
+}
+```
+
+## **3. Benchmarking**
+
+### **3.1 Benchmark 1: Forward Prediction of Perturbation Response**
+
+Given an observed unperturbed control count matrix $\mathbf{Y}^{(0)}\in\mathbb R^{N_0\times J}$, we aim to predict the model-based expected raw perturbed count vector caused by a perturbation on regulator gene $\tilde{g}$. We benchmark the covariance based CIPHER (Kuznets-Speck et al., 2025) approach, sparse precision-matrix estimators, and our simulation based ExprSim ABC approaches.
+
+#### **3.1.1 Data Generation**
+
+Using the hurdle simulator, we first generate an unperturbed control count matrix $\mathbf{Y}^{(0)}\in\mathbb R^{N_0\times J}$ with perturbation fraction $u_{ij}=0$ for all cells and genes. We then define a regulator gene $\tilde{g}\in\{1,\dots,K\}$ to perturb. For cells in the perturbed sample, we set $u_{i\tilde{g}}=s$, $s\in\{0.5,0.9,1.0\}$. The ground-truth is the model-based expected raw perturbed count vector
+
+$$
+\mathbf x^{(\tilde{g})} = \left( x_1^{(\tilde{g})},\dots,x_J^{(\tilde{g})} \right) \in\mathbb R^J,
+$$
+
+where
+
+$$
+x_j^{(\tilde{g})} = \pi_j(1-u_{ij}) \mathbb E_{a_{ik}} \left[ \exp\left( \sum_{k=1}^{K} \beta_{kj}(1-u_k)a_{ik} \right) \right].
+$$
+
+The corresponding model-based expected raw control count vector is
+
+$$
+\mathbf x^{(0)} = \left( x_1^{(0)},\dots,x_J^{(0)} \right) \in\mathbb R^J,
+$$
+
+obtained by setting $u_k=0$ and $u_j=0$ for all genes.
+
+#### **3.1.2 Estimators**
+
+We evaluate how well different methods predict the model-based expected raw perturbed count vector $\hat{\mathbf{x}}^{(\tilde{g})} \in \mathbb{R}^J$.
+
+CIPHER and precision based estimators naturally produce a predicted perturbation shift $\hat{\mathbf{d}}^{(\tilde{g})}$. Because our ground truth is the model-based expected perturbed count vector $\mathbf{x}^{(\tilde{g})}$, we convert each predicted shift to the count scale by adding the control baseline:
+
+$$
+\hat{\mathbf{x}}^{(\tilde{g})} = \mathbf{x}^{(0)} + \hat{\mathbf{d}}^{(\tilde{g})},
+$$
+
+where $\mathbf{x}^{(0)} \in \mathbb{R}^J$ is the model-based expected raw control count vector.
+
+1.  **CIPHER with** $\boldsymbol{\Sigma}$ **(Covariance based):** We compute the empirical sample covariance matrix $\hat{\mathbf{\Sigma}}$ from the unperturbed control count matrix $\mathbf{Y}^{(0)}$. Given the perturbation vector $\mathbf{u}^{(\tilde{g})}$, CIPHER predicts the perturbation shift as
+
+    $$
+    \hat{\mathbf{d}} = \hat{\mathbf{\Sigma}}\mathbf{u}^{(\tilde{g})}.
+    $$
+
+    We then convert this shift to the perturbed count scale:
+
+    $$ \hat{\mathbf{x}}^{(\tilde{g})} = \mathbf{x}^{(0)} + \hat{\mathbf{d}}^{(\tilde{g})} .$$
+
+2.  **CIPHER with** ${\boldsymbol{\Sigma}}'$ **(Direct-edge-cleaned covariance):** Since we have already tested that inverse-inverse computation noise does not change CIPHER's output, we include another diagnostic to test whether CIPHER performance is affected by indirect dependencies in the covariance structure. The idea is to remove entries of the empirical precision matrix that are not supported by the true direct regulatory graph. We first compute the empirical covariance matrix $\hat{\boldsymbol{\Sigma}}$ from the unperturbed control count matrix $\mathbf{Y}^{(0)}$, and then compute the empirical precision matrix $\hat{\boldsymbol{\Omega}}=\hat{\boldsymbol{\Sigma}}^{-1}.$
+
+    Because $\hat{\boldsymbol{\Omega}}\in\mathbb R^{J\times J}$ is a symmetric gene-gene matrix, while the simulator direct-effect matrix $\mathbf B\in\mathbb R^{K\times J}$ is directed from regulators to target genes, we construct a symmetric direct-edge mask $\mathbf E\in\mathbb R^{J\times J}$ from the ground-truth adjacency matrix $\mathbf D\in\mathbb R^{K\times J}$. For two gene indices $p,q\in\{1,\dots,J\}$, the entry $e_{pq}$ of the symmetric mask $\mathbf E$ is defined as
+
+    $$
+    e_{pq}
+    =
+    \begin{cases}
+    1, & p=q,\\
+    1, & p\le K \text{ and } \delta_{pq}=1,\\
+    1, & q\le K \text{ and } \delta_{qp}=1,\\
+    0, & \text{otherwise}.
+    \end{cases}
+    $$
+
+    The diagonal is kept because diagonal precision entries represent self-precision terms rather than regulatory edges. The second and third cases symmetrize the directed regulatory graph: if there is a true directed edge $p\to q$ or $q\to p$, then the corresponding symmetric precision entries are allowed, which matches the fact that $\hat{\boldsymbol{\Omega}}$ is symmetric.
+
+    We then form the direct-edge-cleaned precision matrix
+
+    $$
+    \hat{\boldsymbol{\Omega}}'=\hat{\boldsymbol{\Omega}}\odot \mathbf E.
+    $$
+
+    Finally, we invert the cleaned precision matrix to obtain the direct-edge-cleaned covariance matrix
+
+    $$
+    \hat{\boldsymbol{\Sigma}}'=(\hat{\boldsymbol{\Omega}}')^{-1}.
+    $$
+
+    The predicted perturbation shift is
+
+    $$
+    \hat{\mathbf d}^{(\tilde g)}=\hat{\boldsymbol{\Sigma}}'\mathbf u^{(\tilde g)}.
+    $$
+
+    We then convert this shift to the perturbed count scale:
+
+    $$ \hat{\mathbf{x}}^{(\tilde{g})} = \mathbf{x}^{(0)} + \hat{\mathbf{d}}^{(\tilde{g})} .$$
+
+3.  **CIPHER with** $\mathbf{\Omega}$ **(Precision based):** Building upon the CIPHER framework's linear-response assumption, we estimate a sparse precision matrix $\hat{\mathbf{\Omega}}$ from the unperturbed control count matrix $\mathbf{Y}^{(0)}$. We use spatial estimators, SGLASSO and SCLIME, and the Graphical Elastic Net, GELNET.
+
+    For the spatial estimators, we follow Lu & Feng (2025) to provide robustness against heavy-tailed single-cell distributions. We compute the spatial median $\hat{\boldsymbol{\mu}}$ to define the spatial-sign vectors $\boldsymbol{r}_i = (\boldsymbol{y}_i^{(0)} - \hat{\boldsymbol{\mu}})/\|\boldsymbol{y}_i^{(0)} - \hat{\boldsymbol{\mu}}\|$, yielding the empirical spatial-sign covariance $\widehat{\mathbf{S}} = \frac{1}{N} \sum_{i=1}^N \boldsymbol{r}_i \boldsymbol{r}_i^\top$.
+
+    -   **Spatial Graphical Lasso (SGLASSO):** This approach estimates a sparse precision matrix by applying an $\ell_1$ penalty to the likelihood function based on the spatial-sign covariance (Lu & Feng, 2025). We obtain the estimate by minimizing the penalized negative log-likelihood:
+
+        $$
+        \hat{\mathbf{\Omega}}^{(\text{SGLASSO})} = \underset{\mathbf{\Omega} \succ 0}{\text{arg min}} \left\{ -\log\det(\mathbf{\Omega}) + \text{tr}(J\widehat{\mathbf{S}}\mathbf{\Omega}) + \kappa_n\|\mathbf{\Omega}\|_1 \right\},
+        $$
+
+        where $J\widehat{\mathbf{S}}$ is the scaled spatial-sign covariance matrix and $\kappa_n > 0$ is the tuning parameter that controls the sparsity of the network.
+
+    -   **Spatial Constrained** $\ell_1$**-Minimization (SCLIME):** This approach estimates the precision matrix by solving a constrained $\ell_1$-minimization problem rather than directly penalizing the likelihood (Lu & Feng, 2025). We obtain the estimate by solving:
+
+        $$
+        \hat{\mathbf{\Omega}}^{(\text{SCLIME})} = \underset{\mathbf{\Omega}}{\text{arg min}} \|\mathbf{\Omega}\|_1 \quad \text{subject to} \quad \|J\widehat{\mathbf{S}}\mathbf{\Omega} - \mathbf{I}_J\|_{\infty} \le \kappa_n,
+        $$
+
+        where $\mathbf{I}_J$ is the $J \times J$ identity matrix. Because the SCLIME optimization is solved column-wise, the resulting raw matrix $\hat{\mathbf{\Omega}}^{(1)}$ is not exactly symmetric. We enforce symmetry using min-absolute symmetrization.
+
+    -   **Graphical Elastic Net (GELNET):** As recommended by recent differential co-expression benchmarking studies (Overmann et al., 2026), this approach combines $\ell_1$ and $\ell_2$ penalties to encourage sparsity while maintaining structural stability and retaining highly correlated hub genes. We obtain the estimate by minimizing the penalized negative log-likelihood (Kovács et al., 2021):
+
+        $$
+        \hat{\mathbf{\Omega}}^{(\text{GELNET})} = \underset{\mathbf{\Omega} \succ 0}{\text{arg min}} \left\{ -\log\det(\mathbf{\Omega}) + \text{tr}(\hat{\mathbf{R}}\mathbf{\Omega}) + \kappa \left( \xi\|\mathbf{\Omega}\|_1 + \frac{1-\xi}{2}\|\mathbf{\Omega}\|_2^2 \right) \right\},
+        $$
+
+        where $\widehat{\mathbf{R}}$ is the empirical correlation matrix, $\kappa \ge 0$ controls the overall regularization strength, and $\xi \in [0,1]$ acts as the Elastic Net tuning parameter. Following Kovács et al. (2021), we fix $\xi = 0.5$ to apply an equal mix of $\ell_1$ and $\ell_2$ penalization. Because the $\ell_2$ penalty is highly sensitive to the scale of the variables, the empirical correlation matrix $\widehat{\mathbf{R}}$ is strictly used as the input rather than the covariance matrix.
+
+    For each precision estimator, the predicted perturbation shift is obtained by solving
+
+    $$
+    \hat{\mathbf{\Omega}}\hat{\mathbf{d}}^{(\tilde{g})} = \mathbf{u}^{(\tilde{g})}.
+    $$
+
+    We then convert the shift prediction to perturbed counts
+
+    $$ \hat{\mathbf{x}}^{(\tilde{g})} = \mathbf{x}^{(0)} + \hat{\mathbf{d}}^{(\tilde{g})} .$$
+
+4.  **scGPT:** To include a deep-learning perturbation prediction method, we benchmark a scGPT-style perturbation predictor following the held-out perturbation-prediction logic used in Ahlmann-Eltze et al. (2025). The held-out prediction input is the unperturbed control count matrix $\mathbf{Y}^{(0)}$ and the perturbation vector $\mathbf{u}^{(\tilde g)}$. Because our simulated data is synthetic, scGPT is tuned on simulated perturbation examples from non-held-out regulator genes and evaluated on the held-out regulator gene $\tilde g$. In each replicate, one regulator perturbation is held out for testing and the remaining $K-1$ regulator perturbations are used for tuning. The held-out perturbation proportion is $10\%$, and the non-held-out perturbation proportion is $90\%$. After tuning, scGPT learns a prediction function that maps a control cell vector and a perturbation vector to a predicted perturbed cell vector:
+
+    $$
+    f\left( \mathbf{y}_i^{(0)},\mathbf{u}^{(\tilde g)} \right) = \hat{\mathbf{y}}_i^{(\tilde g)},
+    $$
+
+    where $\mathbf{y}_i^{(0)}\in\mathbb R^J$ is the $i$-th row of $\mathbf{Y}^{(0)}\in\mathbb R^{N_0\times J}$, and $\hat{\mathbf{y}}_i^{(\tilde g)}\in\mathbb R^J$ is the predicted perturbed cell vector for that control cell.
+
+    We average these predicted cell-level vectors to obtain the prediction vector:
+
+    $$
+    \hat{\mathbf{x}}^{(\tilde{g})} = \frac{1}{N_0} \sum_{i=1}^{N_0} \hat{\mathbf{y}}_{i}^{(\tilde g)}.
+    $$
+
+5.  **Rhaister:** Svensson et al. (2026) describe Rhaister as a model that predicts unobserved perturbation responses in a query context using a small observed perturbation panel and reference contexts where both panel and non-panel perturbations are available. In our benchmark, each response statistic is a $J$-dimensional perturbation-shift vector. For perturbation $g$, we define:
+
+    $$
+    \mathbf{d}^{(g)} = \bar{\mathbf{y}}^{(g)} - \mathbf{x}_0,
+    $$
+
+    where $\bar{\mathbf{y}}^{(g)}$ is the mean expression vector across simulated perturbed cells, and $\mathbf{x}_0$ is the expected control expression vector. Thus, each row passed to Rhaister is one observed context–perturbation response vector.
+
+    For a held-out target perturbation $\tilde g$, we define the panel perturbation set as $\mathcal{P} = \{1,\dots,K\}\setminus \{\tilde g\}$.
+
+    -   **Query context** is the context where we want to predict the held-out perturbation response. In the query context, the response of $\tilde g$ is hidden, and only the panel perturbations $\mathcal{P}$ are observed. Therefore, for each $p\in\mathcal{P}$, we simulate $\mathbf{Y}^{(p)}$, compute $\mathbf{d}^{(p)}$, and store it with context label query and perturbation label $p$.
+
+    -   **Reference contexts** are simulated contexts where both the panel perturbations and the held-out target perturbation are observed. For each reference context, we simulate responses for $g\in \mathcal{P}\cup \{\tilde g\}$. These reference rows provide the information needed to learn how the non-panel perturbation responses can be predicted as linear combinations of panel perturbation responses, with weights learned from reference contexts.
+
+    The input table to Rhaister can be written as $d_{c, g, j}$, where $c$ indexes the context, $g$ indexes the perturbation, and $j$ indexes genes. The missing entry to predict is $(c^\ast,g^\ast) = (\mathrm{query},\tilde g)$. Rhaister first fits an additive baseline model:
+
+    $$
+    d_{c,g,j} = \mu_j+\alpha_{c,j}+\beta_{g,j},
+    $$
+
+    where $\alpha_{c,j}$ is the adjustment for being in context $c$, and $\beta_{g,j}$ is the adjustment for perturbation $g$. The additive model is fitted using alternating least squares and can provide an initial prediction for the missing query–target pair. The additive prediction for an unseen pair $(c^\ast,g^\ast)$ is:
+
+    $$
+    \hat d^{\mathrm{add}}_{c^\ast,g^\ast,j} = \mu_j+\alpha_{c^\ast,j}+\beta_{g^\ast,j}.
+    $$
+
+    This additive prediction is used to fill the missing query-target row before the regression step. In the single-target implementation, the model learns a shared weight vector $\hat{\mathbf{w}}$ across all reference contexts by solving:
+
+    $$
+    \hat{\mathbf{w}} = \arg\min_{\mathbf{w}\in\mathbb{R}^{|\mathcal{P}|}} \sum_{c\in\mathcal{C}_{\mathrm{ref}}} \left\| \mathbf{y}_c - \mathbf{X}_c^{T}\mathbf{w} \right\|_2^2 + \lambda\|\mathbf{w}\|_2^2,
+    $$
+
+    Here, $\mathbf{X}_c = \begin{pmatrix} \mathbf{d}_{c,q_1}^{T}\\ \vdots\\ \mathbf{d}_{c,q_{|\mathcal{P}|}}^{T} \end{pmatrix} \in \mathbb{R}^{|\mathcal{P}|\times J}$ contains the observed panel perturbation responses in reference context $c$, and $\mathbf{y}_c = \mathbf{d}_{c,\tilde{g}} \in \mathbb{R}^{J}$ contains the target perturbation response in the same reference context. Each learned weight $\hat{w}_q$ measures how much a specific panel perturbation $q$ contributes to the reconstruction of the held-out perturbation. The same panel weights are applied universally across all $J$ genes.
+
+    The response of the held-out perturbation in a new query context $c^\ast$ is predicted as a linear combination of the observed panel perturbation responses:
+
+    $$
+    \hat{\mathbf{d}}^{(\tilde{g})} = \mathbf{X}_{c^\ast}^{T}\hat{\mathbf{w}} = \sum_{q\in\mathcal{P}} \hat{w}_q\mathbf{d}_{c^\ast,q}
+    $$ Finally, the predicted perturbation-shift vector is added back to the control baseline to obtain the final predicted expression vector:
+
+    $$
+    \hat{\mathbf{x}}^{(\tilde g)} = \mathbf{x}_0+\hat{\mathbf{d}}^{(\tilde g)}.
+    $$
+
+6.  **ExprSim ABC (No true** $\lambda$ **input):** ExprSim uses the simulator perturbation matrix $u_{ij}$, where the nonzero entry is the knockdown strength $s$. We infer the global hyperparameters $\hat{\lambda}$ using ABC-SMC from the unperturbed control data. Given $\hat{\lambda}$, we generate an estimated network and compute the model-based expected raw perturbed count vector:
+
+    $$
+    \hat{\mathbf{x}}^{(\tilde{g})} = \left( \hat x_1^{(\tilde{g})},\dots,\hat x_J^{(\tilde{g})} \right). 
+    $$
+
+7.  **ExprSim ABC with** $\lambda_{\text{best}}$**:** This estimator uses the same model-based expected raw count calculation, but replaces the ABC-estimated simulator hyperparameters with the fixed ground-truth simulator hyperparameters. It provides an upper-bound simulator comparison.
+
+```{r}
+# Lu & Feng (2025) implementation
+spatial_sign_covariance <- function(X) {
+  SpatialNP::SCov(as.matrix(X))
+}
+
+# Spatial likelihood loss for tuning kappa
+likelihood_loss <- function(Omega_hat, S_hat) {
+  J <- nrow(Omega_hat)
+  eig_vals <- eigen(Omega_hat, symmetric = TRUE, only.values = TRUE)$values
+  
+  # If estimated precision is not positive definite, discard this kappa
+  if (min(eig_vals) <= 0) {
+    return(Inf)
+  }
+  
+  sum(Omega_hat * (J * S_hat)) - sum(log(eig_vals))
+}
+
+# SGLASSO, SCLIME, and GELNET estimators
+precision_estimators <- function(X_train, X_val = NULL,
+                                 method = c("sglasso", "sclime", "gelnet"),
+                                 kappa_seq = NULL,
+                                 n_kappa = 50) {
+  
+  method <- match.arg(method)
+  n_train <- nrow(X_train)
+  J <- ncol(X_train)
+
+  # SGLASSO and SCLIME
+  if (method %in% c("sglasso", "sclime")) {
+    
+    # Default spatial kappa grid
+    if (is.null(kappa_seq)) {
+      base_kappa <- sqrt(log(J) / n_train)
+      kappa_seq <- seq(0.05, 1.5, length.out = n_kappa) * base_kappa
+    }
+
+    S_hat_train <- spatial_sign_covariance(X_train)
+    S_hat_val <- spatial_sign_covariance(X_val)
+
+    n_kap <- length(kappa_seq)
+    loss <- numeric(n_kap)
+    Omega_list <- vector("list", n_kap)
+
+    # SGLASSO
+    if (method == "sglasso") {
+      for (k in seq_len(n_kap)) {
+        kap <- kappa_seq[k]
+        fit <- glassoFast::glassoFast(S = J * S_hat_train, rho = kap)
+        Omega_hat <- fit$wi
+        Omega_list[[k]] <- Omega_hat
+        loss[k] <- likelihood_loss(Omega_hat = Omega_hat, S_hat = S_hat_val)
+      }
+    } 
+    
+    # SCLIME
+    else if (method == "sclime") {
+      clime_fit <- clime::clime(x = J * S_hat_train, lambda = kappa_seq, 
+                                sigma = TRUE, standardize = FALSE)
+      for (k in seq_len(n_kap)) {
+        Omega_raw <- clime_fit$Omega[[k]]
+        
+        # Min-absolute symmetrization
+        Omega_sym <- Omega_raw
+        for (i in 1:(J - 1)) {
+          for (j in (i + 1):J) {
+            if (abs(Omega_sym[i, j]) > abs(Omega_sym[j, i])) {
+              Omega_sym[i, j] <- Omega_sym[j, i]
+            } else {
+              Omega_sym[j, i] <- Omega_sym[i, j]
+            }
+          }
+        }
+        
+        Omega_hat <- Omega_sym
+        Omega_list[[k]] <- Omega_hat
+        loss[k] <- likelihood_loss(Omega_hat = Omega_hat, S_hat = S_hat_val)
+      }
+    }
+    
+    best_idx <- which.min(loss)
+    
+    return(list(Omega_opt = Omega_list[[best_idx]]))
+  } 
+
+  # GELNET
+  else if (method == "gelnet") {
+    
+    gen_kappa_grid <- 0.9^c(0:40)
+    
+    # Identify genes with meaningful variance
+    gene_sds <- apply(X_train, 2, sd)
+    good_genes <- which(gene_sds > 1e-5)
+    
+    # Initialize matrix (1s on the diagonal instead of 0s) to prevent inverse explosion
+    Omega_opt_full <- diag(J)
+    Sigma_opt_full <- diag(J)
+    
+    # Only attempt CV if there are enough valid genes
+    if (length(good_genes) >= 2) {
+      
+      # Subset the data
+      X_train_sub <- as.matrix(X_train[, good_genes, drop = FALSE])
+      
+      cv_fit <- tryCatch({
+        GLassoElnetFast::crossvalidation(
+          Y = X_train_sub, 
+          lambda = gen_kappa_grid, 
+          alpha = 0.5, 
+          cor = TRUE,
+          type = "Identity"
+        )
+      }, error = function(e) { return(NULL) })
+      
+      # Map the estimated network back
+      if (!is.null(cv_fit)) {
+        
+        # Each gene’s standard deviation in the training data
+        sd_sub <- apply(X_train_sub, 2, sd)
+        sd_sub[!is.finite(sd_sub) | sd_sub <= 1e-8] <- 1e-8
+        
+        D <- diag(sd_sub)
+        D_inv <- diag(1 / sd_sub)
+        
+        Sigma_sub <- D %*% cv_fit$W %*% D
+        Omega_sub <- D_inv %*% cv_fit$Theta %*% D_inv
+        
+        Sigma_opt_full[good_genes, good_genes] <- Sigma_sub
+        Omega_opt_full[good_genes, good_genes] <- Omega_sub
+      }
+    }
+    
+    # Apply stabilization
+    Omega_opt_full <- make_positive_definite_capped(Omega_opt_full, 
+                                                    min_eig = 1e-6, max_cond = 1e4)
+    Sigma_opt_full <- make_positive_definite_capped(Sigma_opt_full, 
+                                                    min_eig = 1e-6, max_cond = 1e4)
+    
+    return(list(Omega_opt = Omega_opt_full, Sigma_opt = Sigma_opt_full))
+  }
+}
+```
+
+```{r}
+# Simulate a perturbed single-cell count matrix Y^(g,s)
+simulate_perturbed_counts <- function(network, N, g_target, s) {
+  J <- network$J
+  
+  u_ij <- matrix(0, nrow = N, ncol = J)
+  u_ij[, g_target] <- s
+  
+  simulate_hurdle(network, N = N, u_ij = u_ij)
+}
+
+# Run scGPT for one replicate and one knockdown strength
+run_scgpt <- function(network, Y_0, n_pert, g_target, s, n, rep) {
+  
+  scgpt_seed <- 1000000 + 10000 * n + 100 * rep + round(10 * s)
+  
+  old_seed_exists <- exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+  if (old_seed_exists) {
+    old_seed <- get(".Random.seed", envir = .GlobalEnv)
+  }
+  
+  set.seed(scgpt_seed)
+  
+  on.exit({
+    if (old_seed_exists) {
+      assign(".Random.seed", old_seed, envir = .GlobalEnv)
+    } else if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
+      rm(".Random.seed", envir = .GlobalEnv)
+    }
+  }, add = TRUE)
+  
+  J <- network$J
+  K <- network$K
+  
+  run_id <- paste0(
+    "n", n,
+    "_rep", rep,
+    "_s", gsub("\\.", "p", as.character(s)),
+    "_g", g_target
+  )
+  
+  run_dir <- file.path("results/scgpt_bm1", run_id)
+  dir.create(run_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  pred_file <- file.path(run_dir, "prediction.tsv")
+  
+  # Reuse cached scGPT prediction if it already exists
+  if (file.exists(pred_file)) {
+    pred_df <- read.table(pred_file, header = TRUE, sep = "\t")
+    return(as.numeric(pred_df$pred))
+  }
+  
+  # Hold out the true target gene from scGPT training
+  train_genes <- setdiff(seq_len(K), g_target)
+  
+  train_input_list <- list()
+  train_target_list <- list()
+  train_pert_idx <- integer(0)
+  
+  row_id <- 1
+  
+  for (g_train in train_genes) {
+    
+    # Pair control cells with this training perturbation
+    ctrl_idx <- sample(seq_len(nrow(Y_0)), size = n_pert, replace = TRUE)
+    Y_input_g <- Y_0[ctrl_idx, , drop = FALSE]
+    
+    # Simulate perturbed cells for this training perturbation
+    Y_target_g <- simulate_perturbed_counts(network = network, N = n_pert,
+                                            g_target = g_train, s = s)
+    
+    train_input_list[[row_id]] <- Y_input_g
+    train_target_list[[row_id]] <- Y_target_g
+    
+    # Python uses zero-based gene indices
+    train_pert_idx <- c(train_pert_idx, rep(g_train - 1, n_pert))
+    
+    row_id <- row_id + 1
+  }
+  
+  train_input <- do.call(rbind, train_input_list)
+  train_target <- do.call(rbind, train_target_list)
+  
+  write.table(Y_0, file.path(run_dir, "Y0.tsv"),
+              sep = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
+  
+  write.table(train_input, file.path(run_dir, "train_input.tsv"),
+              sep = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
+  
+  write.table(train_target, file.path(run_dir, "train_target.tsv"),
+              sep = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
+  
+  write.table(train_pert_idx, file.path(run_dir, "train_pert_idx.tsv"),
+              sep = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
+  
+  jsonlite::write_json(
+    list(
+      J = J,
+      K = K,
+      g_target_zero_based = g_target - 1,
+      s = s,
+      n = n,
+      rep = rep
+    ),
+    file.path(run_dir, "meta.json"),
+    auto_unbox = TRUE
+  )
+  
+  python_cmd <- "/Users/zhangrui/miniforge3/envs/scgpt/bin/python"
+  
+  status <- system2(
+    command = python_cmd,
+    args = c(
+      "run_scgpt_bm1.py",
+      "--input_dir", run_dir,
+      "--output_file", pred_file,
+      "--epochs", "15",
+      "--patience", "5",
+      "--seed", as.character(scgpt_seed),
+      "--log1p", "1",
+      "--batch_size", "64",
+      "--eval_batch_size", "64"
+    ),
+    stdout = file.path(run_dir, "scgpt_stdout.log"),
+    stderr = file.path(run_dir, "scgpt_stderr.log")
+  )
+  
+  if (!identical(status, 0L) || !file.exists(pred_file)) {
+    warning("scGPT failed for ", run_id, ". Returning NA prediction.")
+    return(rep(NA, J))
+  }
+  
+  pred_df <- read.table(pred_file, header = TRUE, sep = "\t")
+  as.numeric(pred_df$pred)
+}
+```
+
+```{r}
+# Rhaister
+Sys.setenv(RETICULATE_PYTHON = "/Users/zhangrui/miniforge3/envs/scgpt/bin/python")
+source_python("/Users/zhangrui/Desktop/precmat/rhaister.py")
+np <- import("numpy", convert = FALSE)
+rhaister_py <- import_main(convert = TRUE)
+als_decompose <- rhaister_py$`_als_decompose`
+impute_view_into_data <- rhaister_py$`_impute_view_into_data`
+compute_regression <- rhaister_py$`_compute_regression`
+
+# Run Rhaister for one target perturbation
+# learn relationship in reference contexts, then apply that relationship to query context
+run_rhaister <- function(network, x_0, g_target, s, N, panel_genes = NULL, ref_context = 5) {
+
+  J <- network$J
+  K <- network$K
+  
+  # If panel_genes is not given, use all perturbations except the held-out target perturbation
+  if (is.null(panel_genes)) {panel_genes <- setdiff(seq_len(K), g_target)}
+  
+  # Store J-dimensional observed shift vectors
+  d_train_list <- list()
+  
+  # Store the context label for each row, here cells = contexts: query, ref1, ref2,...
+  train_cells <- character(0)
+  
+  # Store the perturbation label for each row, here treatments = perturbations: g1, g2,...
+  train_treatments <- character(0)
+
+  # Query context: the target perturbation is hidden, only observes the panel perturbations
+  for (g in panel_genes) {
+    
+    # Compute the observed shift vector d^(g)
+    Y_g <- simulate_perturbed_counts(network = network, N = N, g_target = g, s = s)
+    d_g <- colMeans(Y_g) - x_0
+
+    d_train_list[[length(d_train_list) + 1]] <- as.numeric(d_g)
+    train_cells <- c(train_cells, "query")
+    train_treatments <- c(train_treatments, paste0("g", g))
+  }
+
+  # Reference contexts: include both panel and held-out target perturbation
+  for (r in seq_len(ref_context)) {
+    
+    # Label current reference context
+    ref_id <- paste0("ref", r)
+    
+    # Measure both panel and target perturbation in this reference context
+    genes_to_measure <- c(panel_genes, g_target)
+    
+    for (g in genes_to_measure) {
+      
+      # Compute the observed shift vector d^(g)
+      Y_g <- simulate_perturbed_counts(network = network, N = N, g_target = g, s = s)
+      d_g <- colMeans(Y_g) - x_0
+
+      d_train_list[[length(d_train_list) + 1]] <- as.numeric(d_g)
+      train_cells <- c(train_cells, ref_id)
+      train_treatments <- c(train_treatments, paste0("g", g))
+    }
+  }
+  
+  # Build data 
+  rhaister_data <- list(
+    
+    # Matrix of observed shift vectors: observed context-perturbation rows × J genes
+    Y_train = do.call(rbind, d_train_list),
+    
+    # Context label for each row of Y_train
+    train_cells = np$array(train_cells, dtype = "object"),
+    
+    # Perturbation label for each row of Y_train
+    train_treatments = np$array(train_treatments, dtype = "object"),
+    
+    # The missing context to predict
+    test_cells = reticulate::r_to_py(list("query"), convert = FALSE),
+    
+    # The missing perturbation to predict in the query context
+    test_treatments = reticulate::r_to_py(list(paste0("g", g_target)), convert = FALSE),
+    
+    # There is one held-out query-target pair
+    n_test = as.integer(1)
+  )
+  
+  # Fit ALS additive baseline
+  rhaister_data$evaluate_test <- function(Y_pred) list()
+  als_result <- als_decompose(data = rhaister_data, return_pred = TRUE, log = FALSE)
+  
+  # Use ALS output to fill missing context-perturbation rows
+  data_reg <- impute_view_into_data(data = rhaister_data, Y_view = rhaister_data$Y_train,
+                                    mu = als_result$mu, cell_eff = als_result$cell_effects,
+                                    treat_eff = als_result$treat_effects,
+                                    cell_map = als_result$local_cell_map,
+                                    treat_map = als_result$local_treat_map,
+                                    label = "BM1 Rhaister")
+  
+  # force length-one test fields to Python lists after filling
+  data_reg$test_cells <- reticulate::r_to_py(list("query"), convert = FALSE)
+  data_reg$test_treatments <- reticulate::r_to_py(list(paste0("g", g_target)), convert = FALSE)
+  
+  # Run Rhaister regression
+  reg_out <- compute_regression(data = data_reg, lam = 1.0, center = FALSE, quiet = TRUE)
+  
+  # Extract the predicted shift matrix
+  d_pred_mat <- reg_out[[1]]
+  
+  # Extract the predicted shift vector for the held-out target perturbation
+  d_hat <- as.numeric(d_pred_mat[1, ])
+  
+  d_hat
+}
+```
+
+```{r}
+# ABC-SMC
+# 1) Summary statistics for ABC
+summaries <- function(X) {
+
+  x_all <- as.vector(X) 
+  x_nonzero <- x_all[x_all > 0 & !is.na(x_all)]
+  
+  if (length(x_nonzero) == 0 || any(!is.finite(x_all))) {
+    return(rep(NA, 54)) 
+  }
+
+  C_i <- rowMeans(X)
+  D_i <- rowMeans(X > 0)
+  G_j <- colMeans(X)
+  M_j <- colMeans(X > 0)
+
+  probs_use <- c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+
+  c(
+    quantile(x_all, probs = probs_use, na.rm = TRUE, names = FALSE),
+    quantile(x_nonzero, probs = probs_use, na.rm = TRUE, names = FALSE),
+    quantile(C_i, probs = probs_use, na.rm = TRUE, names = FALSE),
+    quantile(D_i, probs = probs_use, na.rm = TRUE, names = FALSE),
+    quantile(G_j, probs = probs_use, na.rm = TRUE, names = FALSE),
+    quantile(M_j, probs = probs_use, na.rm = TRUE, names = FALSE)
+  )
+}
+
+# 2) ABC distance
+distance_abc <- function(S_sim, S_obs) {
+  d <- sqrt(sum((S_sim - S_obs)^2))
+  
+  # If distance is NA, return Infinity to force rejection
+  if (!is.finite(d)) {
+    return(Inf)
+  }
+  
+  d
+}
+
+# 3) Prior ranges
+prior_range <- list(
+  theta = c(0.05, 0.95),
+  gamma = c(1.5, 25),
+  rho = c(10, 60),
+  alpha = c(2, 20),
+  sigma2 = c(0.05, 0.15),
+  alpha_phi = c(0.1, 5),
+  beta_phi = c(0.1, 10),
+  alpha_psi = c(0.1, 5),
+  beta_psi = c(0.1, 10)
+)
+
+# Sample one hyperparameter from its prior
+sample_lambda <- function() {
+  list(
+    # Uniform prior
+    theta = runif(1, min = prior_range$theta[1], max = prior_range$theta[2]),
+    
+    # Log-uniform priors
+    gamma = exp(runif(1, min = log(prior_range$gamma[1]), max = log(prior_range$gamma[2]))),
+    rho = exp(runif(1, min = log(prior_range$rho[1]), max = log(prior_range$rho[2]))),
+    alpha = exp(runif(1, min = log(prior_range$alpha[1]), max = log(prior_range$alpha[2]))),
+    sigma2 = exp(runif(1, min = log(prior_range$sigma2[1]), max = log(prior_range$sigma2[2]))),
+    alpha_phi = exp(runif(1, min = log(prior_range$alpha_phi[1]), max = log(prior_range$alpha_phi[2]))),
+    beta_phi = exp(runif(1, min = log(prior_range$beta_phi[1]), max = log(prior_range$beta_phi[2]))),
+    alpha_psi = exp(runif(1, min = log(prior_range$alpha_psi[1]), max = log(prior_range$alpha_psi[2]))),
+    beta_psi = exp(runif(1, min = log(prior_range$beta_psi[1]),max = log(prior_range$beta_psi[2])))
+  )
+}
+
+# 4) Prior density
+prior_density <- function(lambda) {
+
+  inside_support <- (
+    lambda$theta >= prior_range$theta[1] &&
+      lambda$theta <= prior_range$theta[2] &&
+    lambda$gamma >= prior_range$gamma[1] &&
+      lambda$gamma <= prior_range$gamma[2] &&
+    lambda$rho >= prior_range$rho[1] &&
+      lambda$rho <= prior_range$rho[2] &&
+    lambda$alpha >= prior_range$alpha[1] &&
+      lambda$alpha <= prior_range$alpha[2] &&
+    lambda$sigma2 >= prior_range$sigma2[1] &&
+      lambda$sigma2 <= prior_range$sigma2[2] &&
+    lambda$alpha_phi >= prior_range$alpha_phi[1] &&
+      lambda$alpha_phi <= prior_range$alpha_phi[2] &&
+    lambda$beta_phi >= prior_range$beta_phi[1] &&
+      lambda$beta_phi <= prior_range$beta_phi[2] &&
+    lambda$alpha_psi >= prior_range$alpha_psi[1] &&
+      lambda$alpha_psi <= prior_range$alpha_psi[2] &&
+    lambda$beta_psi >= prior_range$beta_psi[1] &&
+      lambda$beta_psi <= prior_range$beta_psi[2]
+  )
+
+  if (!inside_support) {
+    return(0)
+  }
+
+  d_theta <- 1 / (prior_range$theta[2] - prior_range$theta[1])
+  d_log_gamma <- 1 / (log(prior_range$gamma[2]) - log(prior_range$gamma[1]))
+  d_log_rho <- 1 / (log(prior_range$rho[2]) - log(prior_range$rho[1]))
+  d_log_alpha <- 1 / (log(prior_range$alpha[2]) - log(prior_range$alpha[1]))
+  d_log_sigma2 <- 1 / (log(prior_range$sigma2[2]) - log(prior_range$sigma2[1]))
+  d_log_alpha_phi <- 1 / (log(prior_range$alpha_phi[2]) - log(prior_range$alpha_phi[1]))
+  d_log_beta_phi <- 1 / (log(prior_range$beta_phi[2]) - log(prior_range$beta_phi[1]))
+  d_log_alpha_psi <- 1 / (log(prior_range$alpha_psi[2]) - log(prior_range$alpha_psi[1]))
+  d_log_beta_psi <- 1 / (log(prior_range$beta_psi[2]) - log(prior_range$beta_psi[1]))
+
+  d_theta * d_log_gamma * d_log_rho * d_log_alpha * d_log_sigma2 * 
+    d_log_alpha_phi * d_log_beta_phi * d_log_alpha_psi * d_log_beta_psi
+}
+
+# check hyperparameter vector inside support of prior
+in_prior_support <- function(lambda) {
+  prior_density(lambda) > 0
+}
+
+# 5) Simulator
+simulate_X_abc <- function(lambda, N, J, K) {
+  proposed_network <- generate_ground_truth_network(K, J, lambda, seed = NULL)
+  u_ij_ctrl <- matrix(0, nrow = N, ncol = J)
+  return(simulate_hurdle(proposed_network, N, u_ij_ctrl))
+}
+
+# 6) Mean ABC_SMC process
+
+# Convert lambda to numeric vector
+lambda_to_vec <- function(lambda) {
+  c(
+    theta = lambda$theta,
+    log_gamma = log(lambda$gamma),
+    log_rho = log(lambda$rho),
+    log_alpha = log(lambda$alpha),
+    log_sigma2 = log(lambda$sigma2),
+    log_alpha_phi = log(lambda$alpha_phi),
+    log_beta_phi = log(lambda$beta_phi),
+    log_alpha_psi = log(lambda$alpha_psi),
+    log_beta_psi = log(lambda$beta_psi)
+  )
+}
+
+# Convert back
+vec_to_lambda <- function(v) {
+  list(
+    theta = unname(v["theta"]),
+    gamma = exp(unname(v["log_gamma"])),
+    rho = exp(unname(v["log_rho"])),
+    alpha = exp(unname(v["log_alpha"])),
+    sigma2 = exp(unname(v["log_sigma2"])),
+    alpha_phi = exp(unname(v["log_alpha_phi"])),
+    beta_phi = exp(unname(v["log_beta_phi"])),
+    alpha_psi = exp(unname(v["log_alpha_psi"])),
+    beta_psi = exp(unname(v["log_beta_psi"]))
+  )
+}
+
+# Compute the weighted covariance matrix of the particles
+weighted_covariance <- function(X, w) {
+  mu <- colSums(X * w)
+  Xc <- sweep(X, 2, mu, "-")
+  crossprod(Xc * sqrt(w), Xc * sqrt(w))
+}
+
+# Stabilize covariance matrix so chol() does not fail
+make_positive_definite <- function(Sigma, min_eig = 1e-8) {
+  
+  Sigma <- as.matrix(Sigma)
+  Sigma[!is.finite(Sigma)] <- 0
+  
+  # Force symmetry
+  Sigma <- (Sigma + t(Sigma)) / 2
+  
+  eig_vals <- eigen(Sigma, symmetric = TRUE, only.values = TRUE)$values
+  min_val <- min(eig_vals, na.rm = TRUE)
+  
+  if (!is.finite(min_val)) {
+    return(diag(min_eig, nrow(Sigma)))
+  }
+  
+  if (min_val < min_eig) {
+    diag(Sigma) <- diag(Sigma) + (min_eig - min_val)
+  }
+  
+  # Force symmetry again after diagonal adjustment
+  Sigma <- (Sigma + t(Sigma)) / 2
+  
+  Sigma
+}
+
+# Compute the log density of a multivariate Gaussian distribution
+mvnorm_logpdf <- function(x, mean, Sigma) {
+  
+  Sigma <- make_positive_definite(Sigma, min_eig = 1e-8)
+  
+  p <- length(x)
+  
+  cholS <- tryCatch(
+    chol(Sigma),
+    error = function(e) {
+      chol(make_positive_definite(Sigma, min_eig = 1e-6))
+    }
+  )
+  
+  z <- backsolve(cholS, x - mean, transpose = TRUE)
+  
+  out <- -0.5 * (
+    p * log(2 * pi) +
+      2 * sum(log(diag(cholS))) +
+      sum(z^2)
+  )
+  
+  if (!is.finite(out)) {
+    return(-Inf)
+  }
+  
+  out
+}
+
+# Take one old particle and perturb it with a Gaussian random walk
+perturb_lambda <- function(lambda, Sigma_kernel) {
+  
+  Sigma_kernel <- make_positive_definite(Sigma_kernel, min_eig = 1e-8)
+  
+  v <- lambda_to_vec(lambda)
+  v_new <- as.numeric(MASS::mvrnorm(1, mu = v, Sigma = Sigma_kernel))
+  names(v_new) <- names(v)
+  
+  vec_to_lambda(v_new)
+}
+
+# Gaussian proposal density from the old particle to the new one
+kernel_density <- function(lambda_new, lambda_old, Sigma_kernel) {
+  x <- lambda_to_vec(lambda_new)
+  m <- lambda_to_vec(lambda_old)
+  exp(mvnorm_logpdf(x, m, Sigma_kernel))
+}
+
+# Diagnostics
+effective_sample_size <- function(w) {
+  1 / sum(w^2)
+}
+
+# Resampling
+resample_particles <- function(particles, weights) {
+  idx <- sample(seq_along(particles), size = length(particles), replace = TRUE, prob = weights)
+  list(
+    particles = particles[idx],
+    weights = rep(1 / length(particles), length(particles))
+  )
+}
+
+# ABC-SMC algorithm
+abc_smc <- function(S_obs, N, J, K, W, T_pop, eps_quantile, pilot_size) {
+
+  # Store the accepted populations and the epsilon for each step
+  populations <- vector("list", T_pop)
+  eps_vec <- numeric(T_pop)
+
+  # Population 1: Initial Rejection Sampling
+
+  # Run a pilot to determine epsilon_1
+  d_store <- numeric(pilot_size)
+
+  for (m in 1:pilot_size) {
+
+    # Draw hyperparameters from the prior
+    th <- sample_lambda()
+
+    # Simulate a count matrix
+    X_sim <- simulate_X_abc(th, N, J, K)
+
+    # Calculate how far the simulated stats are from the real observed stats
+    d_now <- distance_abc(summaries(X_sim), S_obs)
+
+    # Catch NAs
+    if (is.na(d_now)) d_now <- Inf
+
+    d_store[m] <- d_now
+  }
+
+  # Set the first epsilon threshold to the specified eps_quantile of the pilot distances
+  eps_vec[1] <- as.numeric(quantile(d_store, probs = eps_quantile, na.rm = TRUE))
+
+  # Generate population 1 using the first epsilon
+  particles <- vector("list", W)
+  distances <- numeric(W)
+  n_accept <- 0
+
+  # Keep proposing until we accept exactly W particles
+  while (n_accept < W) {
+
+    th <- sample_lambda()
+    X_sim <- simulate_X_abc(th, N, J, K)
+    d_now <- distance_abc(summaries(X_sim), S_obs)
+
+    # Catch NAs
+    if (is.na(d_now)) d_now <- Inf
+
+    # Accept the particle if its distance <= the threshold
+    if (d_now <= eps_vec[1]) {
+
+      n_accept <- n_accept + 1
+      particles[[n_accept]] <- th
+      distances[n_accept] <- d_now
+    }
+  }
+
+  # All accepted particles are drawn from the prior, so they get equal weights
+  weights <- rep(1 / W, W)
+
+  populations[[1]] <- list(
+    particles = particles,
+    weights = weights,
+    distances = distances,
+    distances_for_epsilon = distances
+  )
+
+  # Populations 2 to T_pop
+  if (T_pop >= 2) {
+
+    for (t in 2:T_pop) {
+
+      # Retrieve the accepted particles and weights from the previous population
+      prev_part <- populations[[t - 1]]$particles
+      prev_w <- populations[[t - 1]]$weights
+
+      # Use the original accepted distances before any ESS resampling
+      prev_distances <- populations[[t - 1]]$distances_for_epsilon
+
+      # Shrink the tolerance threshold based on the previous population
+      eps_vec[t] <- as.numeric(quantile(prev_distances, probs = eps_quantile, na.rm = TRUE))
+
+      # Calculate the covariance of the previous particles to shape perturbation kernel
+      prev_mat <- do.call(rbind, lapply(prev_part, lambda_to_vec))
+      Sigma_kernel <- 2 * weighted_covariance(prev_mat, prev_w)
+
+      # Stabilize the Gaussian proposal covariance
+      Sigma_kernel <- make_positive_definite(Sigma_kernel, min_eig = 1e-8)
+
+      # Store for the new population
+      particles_t <- vector("list", W)
+      distances_t <- numeric(W)
+      weights_t <- numeric(W)
+      n_accept <- 0
+
+      # Keep proposing until we accept exactly W particles
+      while (n_accept < W) {
+
+        # Pick an old particle, favoring those with higher weights
+        idx <- sample(seq_len(W), size = 1, prob = prev_w)
+
+        # Perturb it by adding a little Gaussian noise
+        th_star <- perturb_lambda(prev_part[[idx]], Sigma_kernel)
+
+        # If the perturbed hyperparameters fall outside our defined prior limits, reject
+        if (!in_prior_support(th_star)) next
+
+        # Simulate the data and calculate the distance
+        X_sim <- simulate_X_abc(th_star, N, J, K)
+        d_now <- distance_abc(summaries(X_sim), S_obs)
+
+        # Catch NAs
+        if (is.na(d_now)) d_now <- Inf
+
+        # Accept if it meets the new threshold
+        if (d_now <= eps_vec[t]) {
+
+          # Calculate weights for the newly accepted particle
+          # Numerator: The prior probability of the new hyperparameter
+          num <- prior_density(th_star)
+
+          # Denominator: weighted probability of proposing this new hyperparameter from any of the old particles
+          denom <- sum(prev_w * sapply(prev_part, function(old) {kernel_density(th_star, old, Sigma_kernel)}))
+
+          if (!is.finite(denom) || denom <= 0) {
+            next
+          }
+
+          n_accept <- n_accept + 1
+          particles_t[[n_accept]] <- th_star
+          distances_t[n_accept] <- d_now
+          weights_t[n_accept] <- num / denom
+        }
+      }
+
+      # Normalize weights so they sum to 1
+      weights_t <- weights_t / sum(weights_t)
+
+      # Save the original accepted distances before ESS resampling
+      accepted_distances_t <- distances_t
+
+      # If a few particles have all the weight, we resample to reset them to uniform weights
+      if (effective_sample_size(weights_t) < W / 2) {
+
+        idx_resample <- sample(seq_len(W), size = W, replace = TRUE, prob = weights_t)
+        particles_t <- particles_t[idx_resample]
+        distances_t <- distances_t[idx_resample]
+        weights_t <- rep(1 / W, W)
+      }
+
+      populations[[t]] <- list(
+        particles = particles_t,
+        weights = weights_t,
+        distances = distances_t,
+        distances_for_epsilon = accepted_distances_t
+      )
+    }
+  }
+
+  list(populations = populations)
+}
+```
+
+```{r}
+# Build symmetric J x J direct-edge mask E from delta_kj
+make_E_from_delta <- function(delta_kj, J, K) {
+  E <- diag(J)
+  
+  edge_idx <- which(delta_kj == 1, arr.ind = TRUE)
+  
+  if (nrow(edge_idx) > 0) {
+    k_idx <- edge_idx[, 1]
+    j_idx <- edge_idx[, 2]
+    
+    E[cbind(k_idx, j_idx)] <- 1
+    E[cbind(j_idx, k_idx)] <- 1
+  }
+  E
+}
+
+# Positive-definite stabilization
+make_positive_definite_capped <- function(A, min_eig = 1e-6, max_cond = 1e4) {
+  
+  A <- as.matrix(A)
+  A[!is.finite(A)] <- 0
+  A <- (A + t(A)) / 2
+  
+  eig <- eigen(A, symmetric = TRUE)
+  vals <- eig$values
+  
+  lambda_max <- max(vals, na.rm = TRUE)
+  
+  # Numerically invalid or non-positive, use a small diagonal positive-definite matrix
+  if (!is.finite(lambda_max) || lambda_max <= 0) {
+    return(diag(min_eig, nrow(A)))
+  }
+  
+  # Eigenvalue check:
+  # 1) lambda_min >= min_eig
+  # 2) lambda_max / lambda_min <= max_cond
+  eig_check <- max(min_eig, lambda_max / max_cond)
+  vals <- pmax(vals, eig_check)
+  
+  A_new <- eig$vectors %*% diag(vals, nrow = length(vals)) %*% t(eig$vectors)
+  A_new <- (A_new + t(A_new)) / 2
+  
+  A_new
+}
+
+# Omega' = Omega · E from Sigma_hat
+make_direct_omega_from_sigma <- function(Sigma_hat, E, eps = 1e-6, max_cond = 1e4) {
+  
+  J <- nrow(Sigma_hat)
+  
+  # Stabilize Sigma_hat before inversion
+  Sigma_hat <- make_positive_definite_capped(Sigma_hat, min_eig = eps, max_cond = max_cond)
+  
+  # Omega_hat = Sigma_hat^{-1}
+  Omega_hat <- tryCatch(solve(Sigma_hat), 
+                        error = function(e) matrix(NA, nrow = J, ncol = J))
+  
+  if (any(!is.finite(Omega_hat))) {
+    return(matrix(NA, nrow = J, ncol = J))
+  }
+  
+  Omega_hat <- (Omega_hat + t(Omega_hat)) / 2
+  
+  # Remove entries not supported by the direct-edge mask E
+  Omega_prime <- Omega_hat * E
+  
+  # Stabilize Omega_prime before solving Omega_prime d = u
+  Omega_prime <- make_positive_definite_capped(Omega_prime, min_eig = eps, max_cond = max_cond)
+  
+  Omega_prime
+}
+```
+
+#### **3.1.3 Evaluation Metrics**
+
+To assess how well each method predicts the model-based expected raw perturbed count vector $\mathbf x^{(\tilde{g})}$, we compute the Pearson correlation between the predicted and true expected raw counts across all $J$ genes:
+
+$$
+\text{Corr}(\mathbf{x}^{(\tilde{g})}, \hat{\mathbf{x}}^{(\tilde{g})})
+$$
+
+Here, $\mathbf x^{(\tilde{g})}\in\mathbb R^J$ is the model-based expected raw perturbed count vector, and $\hat{\mathbf x}^{(\tilde{g})}\in\mathbb R^J$ is the predicted expected raw perturbed count vector from each estimator.
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, include = FALSE}
+# Evaluation metric for raw perturbed count X
+X_correlation <- function(x_g_true, X_g_hat) {
+
+  x_g_true <- as.numeric(x_g_true)
+  X_g_hat <- as.numeric(X_g_hat)
+
+  # Return NA if there are NAs, NaNs, or infinite values or either vector has zero variance
+  if (any(!is.finite(X_g_hat)) || any(!is.finite(x_g_true))) {return(NA)}
+  if (sd(x_g_true) == 0 || sd(X_g_hat) == 0) {return(NA)}
+
+  cor(x_g_true, X_g_hat)
+}
+
+# Run Benchmark 1
+run_benchmark1 <- function(network, n_grid, s_grid, n_rep) {
+
+  J <- network$J
+  K <- network$K
+  
+  E_direct <- make_E_from_delta(delta_kj = network$delta_kj, J = J, K = K)
+
+  results <- list()
+  idx <- 1
+
+  # Every single regulator gene is tested exactly an equal number of times
+  target_by_rep <- sample(rep(seq_len(K), length.out = n_rep))
+
+  # ExprSim ABC (no true lambda) gets an estimated network for each replicate
+  net_seed_by_rep <- 100000 + seq_len(n_rep)
+
+  # Iterate over sample sizes
+  for (n in n_grid) {
+
+    # Run replicates for each sample size
+    for (rep in seq_len(n_rep)) {
+
+      # Generate unperturbed control data Y^(0)
+      n_ctrl <- round(n * 20)
+      u_ij_ctrl <- matrix(0, nrow = n_ctrl, ncol = J)
+
+      # Simulate raw UMI counts for the training set and validation set
+      Y_0_counts <- simulate_hurdle(network, N = n_ctrl, u_ij = u_ij_ctrl)
+      Y_val_counts <- simulate_hurdle(network, N = n_ctrl, u_ij = u_ij_ctrl)
+
+      # Use raw counts for count benchmark
+      Y_0 <- Y_0_counts
+      Y_val <- Y_val_counts
+
+      # Calculate summary statistics of the unperturbed data
+      S_obs <- summaries(Y_0_counts)
+
+      # Run the ABC-SMC algorithm to estimate lambda
+      cat(sprintf("\n[BM1 ABC-SMC] J=%d | n_ctrl=%d | rep=%d | n_pert=%d ... ", 
+                  J, n_ctrl, rep, n))
+      smc_fit <- abc_smc(S_obs, N = n_ctrl, J = J, K = K, W=50, 
+                         T_pop=5, eps_quantile=0.25, pilot_size=500)
+      cat("Done.\n")
+
+      # Extract the final ABC population
+      final_pop <- smc_fit$populations[[length(smc_fit$populations)]]
+
+      # Calculate the weighted posterior mean for the estimated lambda hyperparameters
+      lambda_matrix <- do.call(rbind, lapply(final_pop$particles, function(th) {
+        c(theta = th$theta, gamma = th$gamma, rho = th$rho, alpha = th$alpha, 
+          sigma2 = th$sigma2, alpha_phi = th$alpha_phi, beta_phi = th$beta_phi, 
+          alpha_psi = th$alpha_psi, beta_psi = th$beta_psi)
+      }))
+      mean_lambda_est <- colSums(lambda_matrix * final_pop$weights)
+      lambda_est <- as.list(mean_lambda_est)
+
+      # CIPHER, precision estimators use Y^(0)
+      Sigma_hat <- cov(Y_0)
+      
+      # CIPHER diagnostic
+      Omega_hat_prime <- make_direct_omega_from_sigma(Sigma_hat = Sigma_hat, E = E_direct, 
+                                                      eps = 1e-6, max_cond = 1e4)
+
+      sgl_fit <- precision_estimators(Y_0, Y_val, method = "sglasso")
+      scl_fit <- precision_estimators(Y_0, Y_val, method = "sclime")
+      gel_fit <- precision_estimators(Y_0, Y_val, method = "gelnet")
+
+      Omega_sgl <- sgl_fit$Omega_opt
+      Omega_sgl <- make_positive_definite_capped(sgl_fit$Omega_opt, 
+                                                 min_eig = 1e-6, max_cond = 1e4)
+
+      Omega_scl <- scl_fit$Omega_opt
+      Omega_scl <- make_positive_definite_capped(scl_fit$Omega_opt, 
+                                                 min_eig = 1e-6, max_cond = 1e4)
+
+      Sigma_gel <- gel_fit$Sigma_opt
+
+      # Generate estimated network from ABC posterior mean
+      net_est <- generate_ground_truth_network(K, J, lambda_est, seed = net_seed_by_rep[rep])
+
+      # Randomly pick one regulator target for this replicate
+      g_target <- target_by_rep[rep]
+
+      # Model-based expected raw control count vector X^(0)
+      x_0 <- expected_x_g(network = network, g_target = NULL, s = 0, Q = 1000)
+
+      # Iterate through knockdown strengths
+      for (s in s_grid) {
+
+        cat(sprintf("  -> s=%.1f | Estimators:", s))
+
+        # Model-based ground truth: expected raw perturbed count vector x^(g)
+        x_g_true <- expected_x_g(network = network, g_target = g_target, s = s, Q = 1000)
+
+        # Construct perturbation vector
+        u_g <- rep(0, J)
+        u_g[g_target] <- s
+
+        cat(" CIPHER ")
+        d_hat_cipher <- as.numeric(Sigma_hat %*% u_g)
+        X_g_hat_cipher <- x_0 + d_hat_cipher
+        
+        cat(" CIPHER-DirectSigma ")
+        d_hat_cipher_direct <- tryCatch(as.numeric(solve(Omega_hat_prime, u_g)), 
+                                        error = function(e) rep(NA, J))
+        X_g_hat_cipher_direct <- x_0 + d_hat_cipher_direct
+
+        cat(" SGLASSO ")
+        d_hat_sgl <- tryCatch(as.numeric(solve(Omega_sgl, u_g)), 
+                              error = function(e) rep(NA, J))
+        X_g_hat_sgl <- x_0 + d_hat_sgl
+
+        cat(" SCLIME ")
+        d_hat_scl <- tryCatch(as.numeric(solve(Omega_scl, u_g)), 
+                              error = function(e) rep(NA, J))
+        X_g_hat_scl <- x_0 + d_hat_scl
+
+        cat(" GELNET ")
+        d_hat_gel <- as.numeric(Sigma_gel %*% u_g)
+        X_g_hat_gel <- x_0 + d_hat_gel
+
+        cat(" ExprSim ABC ")
+        X_g_hat_abc <- expected_x_g(network = net_est, g_target = g_target, s = s, Q = 1000)
+
+        cat(" ExprSim + lambda ")
+        X_g_hat_true <- expected_x_g(network = network, g_target = g_target, s = s, Q = 1000)
+
+        cat(" scGPT ")
+        X_g_hat_scgpt <- run_scgpt(network = network, Y_0 = Y_0, n_pert = n,
+                                   g_target = g_target, s = s, n = n, rep = rep)
+
+        cat(" Rhaister ")
+        d_hat_rhaister <- run_rhaister(network = network, x_0 = x_0,
+                                         g_target = g_target, s = s, N = n,
+                                         panel_genes = setdiff(seq_len(K), g_target),
+                                         ref_context = 5)
+        X_g_hat_rhaister = x_0 + d_hat_rhaister
+
+        # Evaluation
+        predictions <- list(X_g_hat_cipher, X_g_hat_cipher_direct,
+                            X_g_hat_sgl, X_g_hat_scl, X_g_hat_gel,
+                            X_g_hat_abc, X_g_hat_true, X_g_hat_scgpt, X_g_hat_rhaister)
+
+        methods <- c("CIPHER", "CIPHER-DirectSigma", "SGLASSO", "SCLIME", "GELNET",
+                     "ExprSim ABC", "ExprSim + lambda","scGPT", "Rhaister")
+
+        # Calculate metrics for each method
+        for(m_idx in seq_along(methods)) {
+          
+          corr_val <- X_correlation(x_g_true,predictions[[m_idx]])
+          results[[idx]] <- data.frame(n = n, s = s, rep = rep, target_gene = g_target, 
+                                       method = methods[m_idx],corr = corr_val)
+          idx <- idx + 1
+        }
+        cat("Done.\n")
+      }
+    }
+  }
+
+  dplyr::bind_rows(results)
+}
+
+unlink("results/scgpt_bm1", recursive = TRUE)
+
+# Execute
+set.seed(456)
+bm1_results <- run_benchmark1(
+  network = ground_truth,
+  n_grid = c(5, 20, 50),
+  s_grid = c(0.5, 0.9, 1),
+  n_rep = 50
+)
+```
+
+```{r}
+# Plotting
+plot_bm1_correlation <- function(df) {
+
+  method_order <- c("CIPHER", "CIPHER-DirectSigma", "SGLASSO", "SCLIME", "GELNET", 
+                    "ExprSim ABC", "ExprSim + lambda", "scGPT", "Rhaister")
+  
+  plot_df <- df %>%
+    mutate(n_factor = factor(n), method = factor(method, levels = method_order))
+
+  # Calculate mean correlation and standard deviation across replicates
+  summary_df <- plot_df %>%
+    group_by(n, n_factor, s, method) %>%
+    summarise(mean_corr = mean(corr, na.rm = TRUE), sd_corr = sd(corr, na.rm = TRUE), .groups = "drop") %>%
+    mutate(sd_corr = ifelse(is.na(sd_corr), 0, sd_corr))
+
+  pd_rep <- position_jitterdodge(jitter.width = 0.15, dodge.width = 0.75)
+  pd_mean <- position_dodge(width = 0.75)
+
+  # Plot
+  ggplot(plot_df, aes(x = n_factor, y = corr, color = method)) +
+
+    # Individual replicates
+    geom_point(position = pd_rep, size = 1.5, alpha = 0.15, na.rm = TRUE) +
+
+    # Mean +/- SD
+    geom_errorbar(data = summary_df,
+                  aes(x = n_factor, ymin = mean_corr - sd_corr, ymax = mean_corr + sd_corr, color = method),
+                  width = 0.25, linewidth = 0.8, position = pd_mean,
+                  inherit.aes = FALSE, na.rm = TRUE) +
+
+    # Mean
+    geom_errorbar(data = summary_df,
+                  aes(x = n_factor, ymin = mean_corr, ymax = mean_corr, color = method),
+                  width = 0.5, linewidth = 1.2, position = pd_mean,
+                  inherit.aes = FALSE, na.rm = TRUE) +
+
+    scale_color_discrete(drop = FALSE) +
+    facet_wrap(~ s, labeller = label_both) +
+    labs(title = "Benchmark 1: Correlation",
+         subtitle = paste0("J = 200, K = 10, n = perturbed sample size, ", "control size = 20n, s = knockdown strength"),
+         x = "Perturbed sample size (n)",
+         y = "Correlation",
+         color = "Estimator") +
+
+    theme_classic(base_size = 14) +
+    
+    theme(legend.position = "bottom")
+}
+
+io::qdraw(plot_bm1_correlation(bm1_results), width = 7, height = 5)
+```
